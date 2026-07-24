@@ -146,7 +146,10 @@ fn recording_access_policy(
 pub(crate) fn recording_access_allowed(store: &SettingsStore) -> bool {
     recording_access_policy(
         cfg!(feature = "enterprise-build"),
-        cfg!(debug_assertions),
+        // `debug_assertions` alone only bypasses the gate in debug builds. A
+        // personal release build is local-only and has no account to verify a
+        // plan against, so `no-account-gate` opts it into the same bypass.
+        cfg!(debug_assertions) || cfg!(feature = "no-account-gate"),
         store.local_plan_policy() != LocalPlanPolicy::Unknown,
         store.app_entitled_or_dev(),
         !cfg!(debug_assertions) && store.requires_enterprise_app_for_consumer(),
@@ -1588,6 +1591,13 @@ mod recording_access_tests {
     #[test]
     fn mandatory_enterprise_org_cannot_record_from_consumer_binary() {
         assert!(!recording_access_policy(false, false, true, true, true));
+    }
+
+    #[test]
+    fn dev_bypass_lets_a_signed_out_consumer_record() {
+        // What `no-account-gate` buys a personal build: recording without a
+        // verified plan, which is otherwise unreachable when signed out.
+        assert!(recording_access_policy(false, true, false, false, false));
     }
 }
 

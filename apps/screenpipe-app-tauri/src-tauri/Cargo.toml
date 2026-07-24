@@ -282,6 +282,12 @@ custom-protocol = ["tauri/custom-protocol"]
 # Source builds without this flag will show "auto-updates unavailable"
 official-build = []
 
+# Fork-only: drop the signed-in-account requirement for recording.
+# recording_access_policy otherwise demands a verified local plan, which a
+# personal local-only build can never obtain. Never combine with
+# official-build or enterprise-build.
+no-account-gate = []
+
 # Enterprise build: updates are policy-managed (Intune/MDM or Screenpipe),
 # tauri.enterprise
 # bundle identifier, and the periodic telemetry sync that pushes screen + audio

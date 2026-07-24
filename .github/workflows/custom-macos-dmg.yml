@@ -131,13 +131,16 @@ jobs:
 
           # No `official-build` feature on purpose: is_source_build() stays true,
           # so the in-app updater never fires and never overwrites our changes.
+          # `no-account-gate` is the native half of the sign-in bypass — the
+          # NEXT_PUBLIC_ var only unlocks the UI, while recording.rs refuses to
+          # start the engine without a verified plan.
           # Only the `app` bundle here — the dmg is built after ad-hoc signing,
           # otherwise it would wrap an unsigned .app.
           bunx tauri build -v \
             --no-sign \
             --bundles app \
             --target aarch64-apple-darwin \
-            --features metal,parakeet-mlx,rfdetr-mlx,redact-onnx-coreml
+            --features metal,parakeet-mlx,rfdetr-mlx,redact-onnx-coreml,no-account-gate
 
       # macOS keys TCC grants (Screen Recording, Microphone, Accessibility) to
       # the code signature. Unsigned means re-granting all three every launch;
