@@ -113,12 +113,23 @@ fn get_target_arch() -> &'static str {
     }
 }
 
-/// Check if this is a source/community build (not an official release)
-/// Official releases are built with --features official-build in GitHub Actions
+fn env_flag_is_truthy(value: Option<&str>) -> bool {
+    value
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes"))
+}
+
+/// Check if in-app updates must remain disabled.
+///
+/// Source/community builds never update themselves. The environment override
+/// also protects locally customized release builds from being replaced by an
+/// official bundle that does not contain their changes.
 pub fn is_source_build(_app: &tauri::AppHandle) -> bool {
-    // The official-build feature is only enabled during CI releases
-    // Source builds will not have this feature enabled
-    !cfg!(feature = "official-build") && !cfg!(feature = "enterprise-build")
+    let update_flag = std::env::var("SCREENPIPE_DISABLE_APP_UPDATES").ok();
+    let updates_disabled = env_flag_is_truthy(update_flag.as_deref());
+
+    updates_disabled || (!cfg!(feature = "official-build") && !cfg!(feature = "enterprise-build"))
 }
 
 /// Enterprise build: updates are managed by IT (Intune/RoboPack), not in-app.
@@ -1385,6 +1396,27 @@ mod tests {
         assert_eq!(sweep_sp_old_files(dir.path()), 0);
         assert!(dir.path().join("bun.exe").exists());
         assert!(dir.path().join("cache.sp-old").exists());
+    }
+
+    #[test]
+    fn explicit_update_disable_flag_accepts_common_truthy_values() {
+        for value in ["1", " true ", "TRUE", "yes", "YES"] {
+            assert!(
+                env_flag_is_truthy(Some(value)),
+                "{value:?} should be truthy"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_update_disable_flag_rejects_other_values() {
+        for value in ["", "0", "false", "no", "enabled"] {
+            assert!(
+                !env_flag_is_truthy(Some(value)),
+                "{value:?} should not be truthy"
+            );
+        }
+        assert!(!env_flag_is_truthy(None));
     }
 
     #[test]

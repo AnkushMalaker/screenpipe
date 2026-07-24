@@ -103,6 +103,7 @@ export function useFrameLoading(opts: {
 	const frameLoadStartTimeRef = useRef<number | null>(null);
 	const framesSkippedRef = useRef<number>(0);
 	const lastFrameIdRef = useRef<string | null>(null);
+	const lastUnavailableFrameIdRef = useRef<string | null>(null);
 	// Track currently loaded video chunk to avoid reloading same file
 	const loadedChunkRef = useRef<string | null>(null);
 	// Generation counter to discard stale events
@@ -135,8 +136,16 @@ export function useFrameLoading(opts: {
 			setRenderedImageInfo(null);
 			setSnapshotAssetUrl(null);
 			setDisplayedFallbackUrl(null);
+			if (frameId && !filePath) {
+				const unavailableFrameId = String(frameId);
+				if (lastUnavailableFrameIdRef.current !== unavailableFrameId) {
+					lastUnavailableFrameIdRef.current = unavailableFrameId;
+					onFrameUnavailable?.();
+				}
+			}
 			return;
 		}
+		lastUnavailableFrameIdRef.current = null;
 		setIsLoading(true);
 		const delay = isArrowNav ? FRAME_LOAD_DEBOUNCE_ARROW_MS : FRAME_LOAD_DEBOUNCE_MS;
 		debounceTimerRef.current = setTimeout(() => {
@@ -145,7 +154,14 @@ export function useFrameLoading(opts: {
 		return () => {
 			if (debounceTimerRef.current) clearTimeout(debounceTimerRef.current);
 		};
-	}, [frameId, filePath, offsetIndex, fpsFromServer, isArrowNav]);
+	}, [
+		frameId,
+		filePath,
+		offsetIndex,
+		fpsFromServer,
+		isArrowNav,
+		onFrameUnavailable,
+	]);
 
 	// Detect snapshot frames (event-driven JPEGs) vs video chunks
 	const isSnapshotFrame = useMemo(() => {

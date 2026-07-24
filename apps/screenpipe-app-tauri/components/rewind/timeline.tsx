@@ -1173,7 +1173,8 @@ export default function Timeline({ embedded = false }: { embedded?: boolean }) {
 
 										// Find this frame in our local frames array
 										const validIndex = frames.findIndex(
-											(f) => f.devices?.[0]?.frame_id === validFrameId
+											(f) =>
+												String(f.devices?.[0]?.frame_id) === validFrameId
 										);
 
 										if (validIndex !== -1) {
