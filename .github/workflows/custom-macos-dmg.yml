@@ -1,0 +1,179 @@
+# Personal macOS build: Apple Silicon .dmg with the sign-in / paywall gate
+# bypassed, and no auto-update (so it can't replace itself with an official
+# bundle that lacks our custom commits).
+#
+# This is a fork-only workflow. It deliberately does NOT use any of the
+# upstream release secrets (Apple certs, notarization, Tauri updater keys) —
+# a fork has none of them. The app is ad-hoc signed instead, which is enough
+# for macOS to remember Screen Recording / Microphone / Accessibility grants.
+name: custom macos dmg
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - "custom/**"
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 120
+    env:
+      TARGET: aarch64-apple-darwin
+      # NEXT_PUBLIC_* is inlined by Next at frontend build time, so this must be
+      # set for the whole job — `tauri build` shells out to `bun run build`.
+      # Flips isDevBillingBypassEnabled() → hasAppEntitlement() short-circuits
+      # to true and onboarding's login slide gets a Skip button.
+      NEXT_PUBLIC_SCREENPIPE_DEV_BILLING_BYPASS: "true"
+      SCREENPIPE_RELEASE_TARGET: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.10
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: aarch64-apple-darwin
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ hashFiles('**/Cargo.lock') }}
+          cache-directories: |
+            apps/screenpipe-app-tauri/src-tauri/target
+          shared-key: custom-macos-dmg-aarch64
+          save-if: true
+
+      # pre_build.js downloads ~100MB of sidecars (bun, mlx.metallib, ui_monitor).
+      # Keyed on this workflow file so it only re-downloads when we change it.
+      - name: Cache binary sidecars
+        uses: actions/cache@v4
+        with:
+          path: |
+            apps/screenpipe-app-tauri/src-tauri/ffmpeg
+            apps/screenpipe-app-tauri/src-tauri/ffmpeg-*
+            apps/screenpipe-app-tauri/src-tauri/ffprobe-*
+            apps/screenpipe-app-tauri/src-tauri/bun-*
+            apps/screenpipe-app-tauri/src-tauri/mlx.metallib*
+            apps/screenpipe-app-tauri/src-tauri/ollama-*
+            apps/screenpipe-app-tauri/src-tauri/ui_monitor-*
+          key: custom-macos-dmg-bins-${{ hashFiles('.github/workflows/custom-macos-dmg.yml') }}
+          restore-keys: |
+            custom-macos-dmg-bins-
+
+      - name: Install native deps
+        run: brew install ffmpeg wget
+
+      - name: Install frontend deps
+        working-directory: apps/screenpipe-app-tauri
+        run: bun install
+
+      # Apple Silicon ships mlx.metallib as a sidecar binary, not as a bundled
+      # file. Mirrors the "Configure macOS sidecar bundle entries" step in
+      # release-app.yml — without it the aarch64 bundle is missing MLX kernels.
+      - name: Configure aarch64 sidecar bundle entries
+        run: |
+          node -e '
+            const fs = require("fs");
+            const p = "apps/screenpipe-app-tauri/src-tauri/tauri.macos.conf.json";
+            const c = JSON.parse(fs.readFileSync(p, "utf8"));
+            c.bundle ??= {};
+            c.bundle.macOS ??= {};
+            c.bundle.macOS.files = {};
+            c.bundle.externalBin = [...new Set([...(c.bundle.externalBin ?? []), "mlx.metallib"])];
+            fs.writeFileSync(p, JSON.stringify(c, null, 2) + "\n");
+            console.log("aarch64 sidecars configured");
+          '
+
+      - name: Run pre_build.js
+        working-directory: apps/screenpipe-app-tauri
+        run: bun ./scripts/pre_build.js
+
+      - name: Build app bundle (unsigned)
+        working-directory: apps/screenpipe-app-tauri
+        env:
+          # MLX Metal kernels need the macOS 14 SDK; whisper.cpp's ggml needs
+          # std::filesystem. Both come from the deployment target.
+          MACOSX_DEPLOYMENT_TARGET: "14.0"
+          CMAKE_OSX_DEPLOYMENT_TARGET: "14.0"
+          # -U__ARM_FEATURE_MATMUL_INT8 works around the whisper.cpp i8mm build
+          # error (ggml-org/whisper.cpp#3427).
+          CFLAGS: "-mmacosx-version-min=14.0 -mcpu=apple-m1 -U__ARM_FEATURE_MATMUL_INT8"
+          CXXFLAGS: "-mmacosx-version-min=14.0 -mcpu=apple-m1 -U__ARM_FEATURE_MATMUL_INT8"
+          CMAKE_C_FLAGS: "-mmacosx-version-min=14.0"
+          CMAKE_CXX_FLAGS: "-mmacosx-version-min=14.0"
+          CARGO_PROFILE_RELEASE_LTO: "false"
+          CARGO_INCREMENTAL: "false"
+        run: |
+          set -euo pipefail
+
+          # The cc crate injects -mmacosx-version-min=10.13 into CMAKE_C_FLAGS;
+          # CMake then derives 10.13 and appends it AFTER our 14.0, which breaks
+          # MSL 3.0+ and std::filesystem. Wrap the compilers to rewrite the flag.
+          WRAPPER_DIR="$(pwd)/.compiler-wrapper"
+          mkdir -p "$WRAPPER_DIR"
+          for tool in cc c++ xcrun; do
+            REAL_PATH=$(which $tool)
+            printf '#!/bin/bash\nnew=(); for x in "$@"; do [[ "$x" == -mmacosx-version-min=* ]] && x="-mmacosx-version-min=14.0"; new+=("$x"); done; exec '"$REAL_PATH"' "${new[@]}"\n' > "$WRAPPER_DIR/$tool"
+            chmod +x "$WRAPPER_DIR/$tool"
+          done
+          export PATH="$WRAPPER_DIR:$PATH"
+
+          # No `official-build` feature on purpose: is_source_build() stays true,
+          # so the in-app updater never fires and never overwrites our changes.
+          # Only the `app` bundle here — the dmg is built after ad-hoc signing,
+          # otherwise it would wrap an unsigned .app.
+          bunx tauri build -v \
+            --no-sign \
+            --bundles app \
+            --target aarch64-apple-darwin \
+            --features metal,parakeet-mlx,rfdetr-mlx,redact-onnx-coreml
+
+      # macOS keys TCC grants (Screen Recording, Microphone, Accessibility) to
+      # the code signature. Unsigned means re-granting all three every launch;
+      # an ad-hoc signature is stable as long as the bundle id doesn't change.
+      - name: Ad-hoc sign and package dmg
+        working-directory: apps/screenpipe-app-tauri
+        run: |
+          set -euo pipefail
+          APP="src-tauri/target/aarch64-apple-darwin/release/bundle/macos/screenpipe - Development.app"
+          test -d "$APP" || { echo "app bundle not found at $APP"; ls -R src-tauri/target/aarch64-apple-darwin/release/bundle; exit 1; }
+
+          xattr -cr "$APP"
+          # No --options runtime: hardened runtime plus an ad-hoc signature
+          # rejects dlopen of the sidecars at launch.
+          codesign --force --deep --sign - \
+            --entitlements src-tauri/entitlements.plist \
+            "$APP"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+
+          STAGING="$RUNNER_TEMP/dmg-root"
+          rm -rf "$STAGING" && mkdir -p "$STAGING"
+          cp -R "$APP" "$STAGING/"
+          ln -s /Applications "$STAGING/Applications"
+
+          mkdir -p dist
+          hdiutil create \
+            -volname "screenpipe" \
+            -srcfolder "$STAGING" \
+            -ov -format UDZO \
+            "dist/screenpipe-nosignin-aarch64.dmg"
+          ls -lh dist
+
+      - name: Upload dmg
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenpipe-nosignin-aarch64-dmg
+          path: apps/screenpipe-app-tauri/dist/screenpipe-nosignin-aarch64.dmg
+          if-no-files-found: error
+          retention-days: 14
