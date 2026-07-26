@@ -12,7 +12,7 @@ use crate::capture_session::CaptureSession;
 use crate::config;
 use crate::permissions::do_permissions_check;
 use crate::server_core::ServerCore;
-use crate::store::{LocalPlanPolicy, SettingsStore};
+use crate::store::{resolved_api_auth_key, LocalPlanPolicy, SettingsStore};
 use screenpipe_engine::RecordingConfig;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -601,6 +601,52 @@ async fn probe_server_health(health_url: &str, api_key: Option<&str>) -> bool {
     false
 }
 
+/// True when an external process owns the local API server — typically a
+/// `screenpipe record` instance managed by systemd rather than by this app.
+///
+/// In that mode the app is a *client* of the server, not its owner: it must
+/// never spawn a competing server and must never run `kill_process_on_port`,
+/// which would kill the external recorder to steal the port.
+///
+/// This is an explicit opt-in rather than a probe because probing is a race.
+/// Whoever binds the port first wins, and if the app wins, the external
+/// recorder crashloops on "port already in use" — with `Restart=` set, forever.
+pub fn external_server_mode() -> bool {
+    std::env::var("SCREENPIPE_EXTERNAL_SERVER")
+        .ok()
+        .map(|v| v.trim().to_ascii_lowercase())
+        .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "yes"))
+}
+
+/// Resolve the API auth key and publish it to the shared cache so
+/// `get_local_api_config` can hand it to the webview.
+///
+/// On the external-server path the app never builds a `ServerCore`, so
+/// `state.server` stays `None` and the webview would otherwise be left with no
+/// token — every request to the external server then 403s, which looks like a
+/// broken timeline rather than an auth failure.
+pub async fn seed_api_auth_key_for_external_server(app: &tauri::AppHandle) {
+    let store = SettingsStore::get(app).ok().flatten().unwrap_or_default();
+    if !store.recording.api_auth {
+        return;
+    }
+    let data_dir = screenpipe_core::paths::default_screenpipe_data_dir();
+    let settings_key = if store.recording.api_key.is_empty() {
+        None
+    } else {
+        Some(store.recording.api_key.clone())
+    };
+    match screenpipe_engine::auth_key::resolve_api_auth_key(&data_dir, settings_key.as_deref())
+        .await
+    {
+        Ok(key) => {
+            info!("external server: seeded api auth key for the webview");
+            crate::store::seed_api_auth_key(key);
+        }
+        Err(e) => error!("external server: failed to resolve api auth key: {}", e),
+    }
+}
+
 /// Start recording. Requires the server to be running.
 #[tauri::command]
 #[specta::specta]
@@ -1016,6 +1062,35 @@ async fn spawn_screenpipe_inner(
             }
             warn!("Server exists but not responding, will do full restart");
         }
+    }
+
+    // --- External server: attach, never spawn, never kill ---
+    //
+    // The check above only inspects `state.server`, this app's own handle. When
+    // an external recorder owns the port that handle is `None`, so control would
+    // fall through to the full-start path below — which calls
+    // `kill_process_on_port(port)` and would kill the external recorder.
+    //
+    // Bail out before that. Health is probed only to report status accurately;
+    // the decision itself comes from the env flag, so an external recorder that
+    // is briefly restarting is still never killed or raced.
+    if external_server_mode() {
+        let healthy = probe_server_health(&health_url, resolved_api_auth_key().as_deref()).await;
+        seed_api_auth_key_for_external_server(&app).await;
+        state.is_starting.store(false, Ordering::SeqCst);
+        state.is_starting_capture.store(false, Ordering::SeqCst);
+        if healthy {
+            info!("External server mode: attached to server on port {port}, not spawning our own");
+            crate::health::set_boot_phase("ready", Some("attached to external server"));
+            crate::health::set_recording_status(crate::health::RecordingStatus::Recording);
+        } else {
+            // Not an error we can fix by spawning — that is exactly what would
+            // break the external recorder. Surface it and let it come back.
+            warn!("External server mode: no healthy server on port {port}; waiting for it");
+            crate::health::set_boot_phase("error", Some("external server unreachable"));
+            crate::health::set_recording_status(crate::health::RecordingStatus::Error);
+        }
+        return Ok(());
     }
 
     // --- Full start: server + capture ---

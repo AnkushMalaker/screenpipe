@@ -1658,6 +1658,27 @@ async fn main() {
                 }
                 let store_clone = store.clone();
                 let data_dir_clone = data_dir.clone();
+                // External server mode: a separate process (e.g. a
+                // systemd-managed `screenpipe record`) owns the local API
+                // server. Skip auto-start entirely — spawning would race that
+                // recorder for the port, and losing the race leaves it
+                // crashlooping on "port already in use".
+                //
+                // This block is also the only place that seeds the shared
+                // api_auth_key cache, and it can exit early for reasons that
+                // have nothing to do with auth (entitlement check, lifecycle
+                // lock). When it does, the webview is left with no token and
+                // every request to the external server 403s. Seed it on this
+                // path so that cannot happen.
+                if crate::recording::external_server_mode() {
+                    info!("External server mode: skipping server auto-start");
+                    let app_for_seed = app_handle.clone();
+                    tauri::async_runtime::spawn(async move {
+                        crate::recording::seed_api_auth_key_for_external_server(&app_for_seed)
+                            .await;
+                    });
+                    break 'start_server;
+                }
                 if !crate::recording::recording_access_allowed(&store_clone) {
                     info!("Skipping server auto-start: screenpipe account access required");
                     crate::health::set_recording_status(crate::health::RecordingStatus::Paused);
