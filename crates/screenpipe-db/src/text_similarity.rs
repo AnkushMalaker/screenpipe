@@ -11,6 +11,13 @@
 /// This module provides similarity functions to detect these cross-device duplicates.
 use std::collections::HashSet;
 
+/// Below this many words, only an exact match counts as a duplicate.
+///
+/// Short phrases overlap by accident — a few common words shared by unrelated
+/// content clear any threshold. Shared by every comparison in this module so
+/// the transcription and screen paths cannot drift apart.
+const MIN_DEDUP_WORDS: usize = 4;
+
 /// Calculate word-level Jaccard similarity between two strings.
 /// Returns a value between 0.0 (no overlap) and 1.0 (identical word sets).
 ///
@@ -78,6 +85,25 @@ pub fn is_similar_transcription(s1: &str, s2: &str, threshold: f64) -> bool {
     is_similar_words(&normalize_to_words(s1), &normalize_to_words(s2), threshold)
 }
 
+/// Like [`is_similar_transcription`] but over two already-normalized word lists
+/// and **without** the containment test.
+///
+/// Containment is right for transcriptions, where two copies of the same speech
+/// are interchangeable and folding the short one into the long one loses
+/// nothing. It is wrong when the two texts are successive readings of something
+/// that can grow: a page that finishes loading, or a view that gains a row,
+/// fully contains its earlier self, so containment would report a duplicate and
+/// the caller would discard the *more* complete reading.
+///
+/// Keeps the short-phrase rule, which is about noise rather than direction: a
+/// handful of words overlap by accident too easily to be evidence of anything.
+pub fn is_near_duplicate_text(words1: &[String], words2: &[String], threshold: f64) -> bool {
+    if words1.len() < MIN_DEDUP_WORDS && words2.len() < MIN_DEDUP_WORDS {
+        return words1 == words2;
+    }
+    word_jaccard_similarity_words(words1, words2) >= threshold
+}
+
 /// Tokenize a transcription into normalized words. Exposed so a caller that
 /// compares one new transcription against many existing ones (the DB dedup
 /// loop) can normalize the new text once and reuse it via
@@ -98,7 +124,7 @@ fn is_similar_words(words1: &[String], words2: &[String], threshold: f64) -> boo
     // Don't deduplicate very short phrases - they're often false positives
     // (common words that appear in unrelated conversations). Require exact
     // match (after normalization) for them.
-    if words1.len() < 4 && words2.len() < 4 {
+    if words1.len() < MIN_DEDUP_WORDS && words2.len() < MIN_DEDUP_WORDS {
         return words1 == words2;
     }
 

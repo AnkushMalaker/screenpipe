@@ -47,6 +47,7 @@ impl<S: Send + Sync> FromRequestParts<S> for OptionalPipePerms {
 impl oasgen::OaParameter for OptionalPipePerms {}
 
 use chrono::{DateTime, Datelike, Local, Timelike, Utc};
+use screenpipe_db::text_similarity::{is_near_duplicate_text, normalize_transcription};
 use screenpipe_db::{ContentType, Order, SearchResult, SemanticContextQuery, SemanticFrameContext};
 use screenpipe_semantic::{IdentityQuality, SemanticKind};
 
@@ -217,6 +218,24 @@ pub(crate) struct SearchQuery {
     /// instead of several follow-up queries. No-op without `tags`.
     #[serde(default, deserialize_with = "deserialize_flexible_bool")]
     include_related: bool,
+    /// Collapse consecutive near-duplicate screen results, keeping the first of
+    /// each run. The value is the word-overlap threshold, e.g. `dedupe=0.85`;
+    /// omit it for no deduplication.
+    ///
+    /// Consecutive frames of an unchanged window repeat nearly all of their
+    /// text, so a caller that wants "the screens in this interval" pays for
+    /// many copies of each. Filtering here rather than at the caller keeps that
+    /// text off the wire: measured over one workstation's conversation windows,
+    /// 35.7 MB of OCR carried 10.9 MB of distinct screens.
+    ///
+    /// Only frames whose text came from the accessibility tree are compared —
+    /// see [`collapse_near_duplicates`] for why OCR-only frames are exempt.
+    /// `limit` still bounds rows *scanned*, so a deduplicated page returns
+    /// fewer rows than the limit; `pagination.total` and `deduped` describe
+    /// what happened. Runs are collapsed within a page, so paging with a
+    /// `dedupe` set can still return a duplicate across a page boundary.
+    #[serde(default)]
+    dedupe: Option<f64>,
     /// Output format: `json` (default), `csv`, or `tsv`/`table`. CSV/TSV emit a
     /// columnar table (column names written once) instead of one JSON object
     /// per row. For text-heavy `ocr`/`audio` results the `text` blob dominates
@@ -403,6 +422,12 @@ pub struct SearchResponse {
     /// yielded co-occurring tags; omitted otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub related: Option<std::collections::HashMap<String, Vec<String>>>,
+    /// How many results `dedupe` collapsed out of this page. Present only when
+    /// the request set `dedupe`. Without it a caller cannot tell a page short of
+    /// `limit` because the interval was quiet from one short because its screens
+    /// were repetitive.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deduped: Option<usize>,
 }
 
 /// How many co-occurring tags to pull for the `related` block. Spread across
@@ -831,6 +856,89 @@ fn deduplicate_ocr_and_ui(content_items: &mut Vec<ContentItem>) {
     }
 }
 
+/// Word-overlap floor below which a `dedupe` value is rejected.
+///
+/// Under this, unrelated screens start folding into each other: two pages that
+/// merely share their chrome and common words can clear a low threshold. The
+/// value the store's own transcription dedup uses is 0.85, which sits well
+/// inside the safe range.
+const MIN_DEDUPE_THRESHOLD: f64 = 0.5;
+
+/// Text origins whose word overlap actually means something.
+///
+/// Accessibility text is the OS-native tree: dense, ordered, and stable between
+/// frames of an unchanged window. `ocr` is the fallback used where a window
+/// exposes no tree at all — every fullscreen window on a KDE Wayland session —
+/// and there the text is a few HUD fragments that read alike whether or not the
+/// moment is the same. Overlap is evidence for the first and noise for the
+/// second, so only the first is compared.
+const COMPARABLE_TEXT_SOURCES: [&str; 2] = ["accessibility", "hybrid"];
+
+/// Reject a `dedupe` threshold that would collapse unrelated screens.
+///
+/// Fails the request rather than clamping: a caller that asked for `dedupe=0.1`
+/// has misunderstood the parameter, and silently treating it as 0.5 would hand
+/// back a result set missing rows it never agreed to lose.
+fn validate_dedupe(dedupe: Option<f64>) -> Result<(), (StatusCode, JsonResponse<Value>)> {
+    let Some(threshold) = dedupe else {
+        return Ok(());
+    };
+    if (MIN_DEDUPE_THRESHOLD..=1.0).contains(&threshold) {
+        return Ok(());
+    }
+    Err((
+        StatusCode::BAD_REQUEST,
+        JsonResponse(json!({
+            "error": "invalid_dedupe",
+            "message": format!(
+                "dedupe must be between {MIN_DEDUPE_THRESHOLD} and 1.0, got {threshold}"
+            ),
+        })),
+    ))
+}
+
+/// Collapse consecutive near-duplicate screen results in place, returning how
+/// many were removed.
+///
+/// Compares each candidate against the last *kept* item rather than its
+/// immediate predecessor, so a window that drifts slowly still yields a new
+/// result once it has drifted far enough. Only screen results are considered;
+/// audio, UI, input and memory items pass through untouched, as do frames whose
+/// text did not come from the accessibility tree and frames belonging to a
+/// different window than the one being compared against.
+///
+/// Reuses [`screenpipe_db::text_similarity::is_similar_words`], the same
+/// comparison the store applies to cross-device transcription duplicates,
+/// including its rule that texts under four words must match exactly.
+fn collapse_near_duplicates(content_items: &mut Vec<ContentItem>, threshold: f64) -> usize {
+    let mut kept: Option<(String, String, Vec<String>)> = None;
+    let before = content_items.len();
+    content_items.retain(|item| {
+        let ContentItem::OCR(ocr) = item else {
+            return true;
+        };
+        let comparable = ocr
+            .text_source
+            .as_deref()
+            .is_some_and(|source| COMPARABLE_TEXT_SOURCES.contains(&source));
+        if !comparable {
+            return true;
+        }
+        let words = normalize_transcription(&ocr.text);
+        if let Some((app, window, previous)) = &kept {
+            if app == &ocr.app_name
+                && window == &ocr.window_name
+                && is_near_duplicate_text(previous, &words, threshold)
+            {
+                return false;
+            }
+        }
+        kept = Some((ocr.app_name.clone(), ocr.window_name.clone(), words));
+        true
+    });
+    before - content_items.len()
+}
+
 /// Compute a cache key for a search query by hashing its parameters
 pub(crate) fn compute_search_cache_key(query: &SearchQuery) -> u64 {
     let mut hasher = DefaultHasher::new();
@@ -862,6 +970,9 @@ pub(crate) fn compute_search_cache_key(query: &SearchQuery) -> u64 {
     query.device_name.hash(&mut hasher);
     query.machine_id.hash(&mut hasher);
     query.filter_pii.hash(&mut hasher);
+    // dedupe removes rows, so a cached un-deduplicated response must not be
+    // served for a deduplicated query (or vice-versa). f64 is not Hash.
+    query.dedupe.map(f64::to_bits).hash(&mut hasher);
     // Tags change the result set materially — must be in the cache key so a
     // cached untagged response can't be served for a tag-filtered query.
     query.tags.hash(&mut hasher);
@@ -960,6 +1071,7 @@ pub(crate) async fn search(
     let format = parse_format(&query.format)?;
     let fields = parse_fields(&query.fields);
     let cacheable_render = is_passthrough(format, &fields);
+    validate_dedupe(query.dedupe)?;
 
     let pipe_data_restricted = pipe_perms
         .as_ref()
@@ -1401,6 +1513,17 @@ pub(crate) async fn search(
         None
     };
 
+    let deduped = query.dedupe.map(|threshold| {
+        let removed = collapse_near_duplicates(&mut content_items, threshold);
+        debug!(
+            "dedupe at {:.2} collapsed {} of {} screen results",
+            threshold,
+            removed,
+            removed + content_items.len()
+        );
+        removed
+    });
+
     let response = SearchResponse {
         data: content_items,
         pagination: PaginationInfo {
@@ -1410,6 +1533,7 @@ pub(crate) async fn search(
         },
         cloud,
         related,
+        deduped,
     };
 
     capture_direct_api_search_value(&api_client, response.data.len());
@@ -1635,6 +1759,7 @@ mod tests {
             filter_pii: false,
             tags: None,
             include_related: false,
+            dedupe: None,
             format: None,
             fields: None,
         }
@@ -2049,6 +2174,7 @@ mod tests {
     fn test_search_cache_key_deterministic() {
         // Same query should produce same cache key
         let query1 = SearchQuery {
+            dedupe: None,
             q: Some("test".to_string()),
             pagination: PaginationQuery {
                 limit: 10,
@@ -2084,6 +2210,7 @@ mod tests {
         };
 
         let query2 = SearchQuery {
+            dedupe: None,
             q: Some("test".to_string()),
             pagination: PaginationQuery {
                 limit: 10,
@@ -2127,6 +2254,7 @@ mod tests {
     #[test]
     fn test_search_cache_key_differs_for_different_queries() {
         let query1 = SearchQuery {
+            dedupe: None,
             q: Some("test".to_string()),
             pagination: PaginationQuery {
                 limit: 10,
@@ -2162,6 +2290,7 @@ mod tests {
         };
 
         let query2 = SearchQuery {
+            dedupe: None,
             q: Some("different".to_string()),
             pagination: PaginationQuery {
                 limit: 10,
@@ -2212,6 +2341,7 @@ mod tests {
     #[test]
     fn test_search_cache_key_distinguishes_on_screen() {
         let mk = |on_screen: Option<bool>| SearchQuery {
+            dedupe: None,
             q: Some("test".to_string()),
             pagination: PaginationQuery {
                 limit: 10,
@@ -2258,6 +2388,7 @@ mod tests {
     #[test]
     fn test_search_cache_key_distinguishes_include_related() {
         let mk = |include_related: bool| SearchQuery {
+            dedupe: None,
             q: Some("test".to_string()),
             pagination: PaginationQuery {
                 limit: 10,
@@ -2353,6 +2484,7 @@ mod tests {
             })
         };
         let response = |data| SearchResponse {
+            deduped: None,
             data,
             pagination: PaginationInfo {
                 limit: 20,
@@ -2421,5 +2553,153 @@ mod tests {
         let result = truncate_middle(text, 10);
         assert!(result.chars().count() > 10); // marker adds chars, but original content is truncated
         assert!(result.contains("...(truncated"));
+    }
+
+    /// A screenful of accessibility text with `replaced` words swapped out.
+    /// Sized like a real capture — short strings move word overlap far too much
+    /// to stand in for one.
+    fn screen_text(replaced: usize) -> String {
+        let kept = (0..60usize.saturating_sub(replaced)).map(|i| format!("word{i}"));
+        let fresh = (0..replaced).map(|i| format!("fresh{i}"));
+        kept.chain(fresh).collect::<Vec<_>>().join(" ")
+    }
+
+    fn screen(frame_id: i64, text: String, window: &str, source: &str) -> ContentItem {
+        let mut ocr = test_ocr(frame_id, "chunk.mp4");
+        ocr.text = text;
+        ocr.window_name = window.to_string();
+        ocr.text_source = Some(source.to_string());
+        ContentItem::OCR(ocr)
+    }
+
+    fn frame_ids(items: &[ContentItem]) -> Vec<i64> {
+        items
+            .iter()
+            .filter_map(|item| match item {
+                ContentItem::OCR(ocr) => Some(ocr.frame_id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn dedupe_collapses_an_unchanged_window() {
+        let mut items = (0..4)
+            .map(|i| screen(i, screen_text(0), "Inbox", "accessibility"))
+            .collect();
+
+        let removed = collapse_near_duplicates(&mut items, 0.85);
+
+        assert_eq!(removed, 3);
+        assert_eq!(frame_ids(&items), vec![0]);
+    }
+
+    #[test]
+    fn dedupe_keeps_a_screen_that_actually_changed() {
+        let mut items = vec![
+            screen(0, screen_text(0), "Inbox", "accessibility"),
+            screen(1, screen_text(40), "Inbox", "accessibility"),
+        ];
+
+        assert_eq!(collapse_near_duplicates(&mut items, 0.85), 0);
+    }
+
+    #[test]
+    fn dedupe_compares_against_the_last_kept_frame_so_drift_accumulates() {
+        // No single step clears the threshold, but the window still ends up
+        // somewhere else. Comparing against the previous *frame* would drop
+        // every one of these and lose the change entirely.
+        let mut items = (0..3)
+            .map(|i| screen(i, screen_text((i as usize) * 4), "Editor", "accessibility"))
+            .collect();
+
+        collapse_near_duplicates(&mut items, 0.85);
+
+        assert_eq!(frame_ids(&items), vec![0, 2]);
+    }
+
+    #[test]
+    fn dedupe_does_not_span_windows() {
+        let mut items = vec![
+            screen(0, screen_text(0), "Inbox", "accessibility"),
+            screen(1, screen_text(0), "Calendar", "accessibility"),
+        ];
+
+        assert_eq!(collapse_near_duplicates(&mut items, 0.85), 0);
+    }
+
+    #[test]
+    fn dedupe_exempts_ocr_only_frames() {
+        // No accessibility tree — a fullscreen window on KDE Wayland. The text
+        // is a few HUD fragments that read alike whether or not the moment is
+        // the same, so overlap is not evidence here.
+        let mut items = vec![
+            screen(0, "2 V Delete BARRACKS 1402".to_string(), "", "ocr"),
+            screen(1, "2 V Delete BARRACKS 1409".to_string(), "", "ocr"),
+        ];
+
+        assert_eq!(collapse_near_duplicates(&mut items, 0.85), 0);
+        assert_eq!(frame_ids(&items), vec![0, 1]);
+    }
+
+    #[test]
+    fn dedupe_exempts_frames_with_no_recorded_text_source() {
+        // Legacy rows predate the column; nothing is known about how the text
+        // was read, so leave them alone.
+        let mut items: Vec<ContentItem> = (0..3)
+            .map(|i| {
+                let mut ocr = test_ocr(i, "chunk.mp4");
+                ocr.text = screen_text(0);
+                ocr.text_source = None;
+                ContentItem::OCR(ocr)
+            })
+            .collect();
+
+        assert_eq!(collapse_near_duplicates(&mut items, 0.85), 0);
+    }
+
+    #[test]
+    fn dedupe_leaves_non_screen_results_alone() {
+        let mut items = vec![
+            ContentItem::UI(test_ui(1, "same text", Utc::now())),
+            ContentItem::UI(test_ui(2, "same text", Utc::now())),
+        ];
+
+        assert_eq!(collapse_near_duplicates(&mut items, 0.85), 0);
+        assert_eq!(items.len(), 2);
+    }
+
+    #[test]
+    fn a_grown_screen_is_not_folded_into_the_sparse_one_before_it() {
+        // Containment would call this a duplicate and drop the *fuller* read;
+        // is_near_duplicate_text deliberately omits that test.
+        let mut items = vec![
+            screen(
+                0,
+                "loading please wait".to_string(),
+                "Docs",
+                "accessibility",
+            ),
+            screen(
+                1,
+                format!("loading please wait {}", screen_text(0)),
+                "Docs",
+                "accessibility",
+            ),
+        ];
+
+        assert_eq!(collapse_near_duplicates(&mut items, 0.85), 0);
+        assert_eq!(frame_ids(&items), vec![0, 1]);
+    }
+
+    #[test]
+    fn dedupe_threshold_is_range_checked() {
+        assert!(validate_dedupe(None).is_ok());
+        assert!(validate_dedupe(Some(0.85)).is_ok());
+        assert!(validate_dedupe(Some(1.0)).is_ok());
+        // Low enough to fold unrelated screens together — reject rather than
+        // quietly clamp, so a caller never loses rows it did not agree to lose.
+        assert!(validate_dedupe(Some(0.1)).is_err());
+        assert!(validate_dedupe(Some(1.5)).is_err());
     }
 }
