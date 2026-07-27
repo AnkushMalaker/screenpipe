@@ -1236,6 +1236,7 @@
       "files": [
         "src/incognito/linux.rs",
         "src/platform/linux.rs",
+        "src/platform/linux_kwin.rs",
         "src/tree/linux.rs",
         "src/tree/linux_lines.rs"
       ],
