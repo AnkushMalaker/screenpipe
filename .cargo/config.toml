@@ -22,6 +22,21 @@ CMAKE_POLICY_VERSION_MINIMUM = "3.5"
 # into the already-bundled SQLite library so recovery never depends on a host
 # `sqlite3` executable or platform package manager.
 LIBSQLITE3_FLAGS = "SQLITE_ENABLE_DBPAGE_VTAB"
+# antirez-asr-sys compiles its qwen-asr C sources with -std=c11, which puts
+# glibc in strict-ANSI mode and hides POSIX `strdup`. GCC 14 promoted implicit
+# function declarations from a warning to an error, so on a modern toolchain
+# (GCC 16 here) the build dies with "implicit declaration of function 'strdup'".
+# Upstream CI runs an older GCC and never sees it. _GNU_SOURCE re-exposes the
+# POSIX declarations without changing the -std the crate asked for.
+#
+# The same block exists in apps/screenpipe-app-tauri/src-tauri/.cargo/config.toml.
+# Cargo reads the config of the directory it is invoked from, so the app build
+# (install-local.sh, run from src-tauri/) and a workspace-root build of the
+# `screenpipe` CLI need it independently — fixing only one leaves the other
+# broken on any GCC 14+ host.
+# Target-scoped so macOS builds are untouched; cc-rs reads CFLAGS_<target>
+# before the generic CFLAGS.
+CFLAGS_x86_64_unknown_linux_gnu = { value = "-D_GNU_SOURCE", force = false }
 
 # Cargo already uses the machine's available parallelism. A fixed value made
 # 10-core developer machines run 16 compiler processes at once, increasing
