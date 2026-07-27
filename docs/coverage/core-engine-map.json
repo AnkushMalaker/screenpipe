@@ -298,6 +298,7 @@
         "src/local_chat.rs",
         "src/pipe_stream.rs",
         "src/routes/activity_summary.rs",
+        "src/routes/app_runs.rs",
         "src/routes/artifacts.rs",
         "src/routes/connect_broker.rs",
         "src/routes/content.rs",
