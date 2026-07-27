@@ -1018,6 +1018,7 @@ pub fn get_active_window_info() -> Option<(String, String, i32)> {
 pub fn get_active_window_info_fresh() -> Option<(String, String, i32)> {
     get_hyprland_active_window_info()
         .or_else(get_sway_active_window_info)
+        .or_else(crate::platform::linux_kwin::get_kwin_active_window_info)
         .or_else(get_x11_active_window_info)
 }
 
@@ -1211,6 +1212,33 @@ fn get_x11_active_window_info() -> Option<(String, String, i32)> {
         "Unknown".to_string()
     };
 
+    x11_window_result(app_name, title, pid)
+}
+
+/// Decide whether an xdotool lookup actually identified anything.
+///
+/// Split out from [`get_x11_active_window_info`] so the guard is testable
+/// without an X server.
+///
+/// On a Wayland session with XWayland running, `_NET_ACTIVE_WINDOW` points at
+/// an XWayland stub whenever a native Wayland window is focused. `xdotool
+/// getwindowname` on that stub **exits 0 with empty output** — a success, not a
+/// failure — so the caller's `status.success()` filter passes it through, and
+/// only `getwindowpid` fails. The old code turned that into
+/// `("Unknown", "", 0)`: a `Some` carrying a fabricated app name.
+///
+/// That is worse than returning nothing, because Linux prefers this source over
+/// the accessibility tree (`resolve_capture_metadata_with_policy`), so the
+/// string `"Unknown"` overwrites correct AT-SPI names for every frame. Measured
+/// on a KDE Wayland session: installing xdotool relabelled every captured frame
+/// from its real app to `"Unknown"` within seconds.
+///
+/// A lookup that produced neither a title nor a pid identified nothing, so say
+/// so and let the caller fall through to another source.
+fn x11_window_result(app_name: String, title: String, pid: i32) -> Option<(String, String, i32)> {
+    if pid <= 0 && title.is_empty() {
+        return None;
+    }
     Some((app_name, title, pid))
 }
 
@@ -1594,6 +1622,32 @@ mod tests {
     fn test_truncate() {
         assert_eq!(truncate("hello", 10), "hello");
         assert_eq!(truncate("hello world", 8), "hello...");
+    }
+
+    #[test]
+    fn x11_result_rejects_the_xwayland_stub_window() {
+        // `getwindowname` on the stub exits 0 with empty output and
+        // `getwindowpid` fails, so the caller arrives here with a synthesised
+        // "Unknown" and nothing else. Returning Some would let that string
+        // override the accessibility tree's correct app name.
+        assert_eq!(
+            x11_window_result("Unknown".to_string(), String::new(), 0),
+            None
+        );
+    }
+
+    #[test]
+    fn x11_result_keeps_windows_that_identified_something() {
+        // A real X11 window with no _NET_WM_PID still has a usable title.
+        assert_eq!(
+            x11_window_result("Unknown".to_string(), "xmessage".to_string(), 0),
+            Some(("Unknown".to_string(), "xmessage".to_string(), 0))
+        );
+        // A pid alone is enough: the app name comes from /proc.
+        assert_eq!(
+            x11_window_result("firefox".to_string(), String::new(), 4321),
+            Some(("firefox".to_string(), String::new(), 4321))
+        );
     }
 
     #[test]
