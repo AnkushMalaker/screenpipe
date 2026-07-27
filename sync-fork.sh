@@ -9,12 +9,15 @@
 #   ./sync-fork.sh --push     also push the rebased branch to the fork remote
 #   ./sync-fork.sh --check    report how far behind we are, change nothing
 #
+# The fork keeps a single branch, `chronicle` — the branch Chronicle consumes.
+# It carries the Linux capture fixes plus /search?dedupe and /app-runs, and
+# rebases directly onto upstream main.
 set -euo pipefail
 
 cd "$(dirname "$0")"
 
 UPSTREAM_URL_MATCH="screenpipe/screenpipe"
-BRANCH="${SYNC_BRANCH:-custom/linux-timeline-stability}"
+BRANCH="${SYNC_BRANCH:-chronicle}"
 
 die() { echo "error: $*" >&2; exit 1; }
 
@@ -33,32 +36,33 @@ done < <(git remote -v | awk '$3 == "(fetch)"')
 [[ -n "$upstream_remote" ]] || die "no remote points at $UPSTREAM_URL_MATCH"
 [[ -n "$fork_remote" ]] || die "no fork remote found"
 
-echo "upstream: $upstream_remote   fork: $fork_remote   branch: $BRANCH"
+onto="$upstream_remote/main"
+echo "upstream: $upstream_remote   fork: $fork_remote   branch: $BRANCH   onto: $onto"
 
 # Upstream has hundreds of agent/* branches; fetching only main keeps this
 # from pulling tens of MB of refs we never look at.
 echo "==> fetching $upstream_remote/main"
 git fetch --no-tags "$upstream_remote" main
 
-base=$(git merge-base "$BRANCH" "$upstream_remote/main")
-behind=$(git rev-list --count "$base..$upstream_remote/main")
+base=$(git merge-base "$BRANCH" "$onto")
+behind=$(git rev-list --count "$base..$onto")
 ours=$(git rev-list --count "$base..$BRANCH")
 echo "==> $behind new upstream commit(s); $ours local commit(s) on top"
 
 if [[ "${1:-}" == "--check" ]]; then
 	[[ "$behind" -eq 0 ]] && echo "up to date." || \
-		git log --oneline "$base..$upstream_remote/main" | head -20
+		git log --oneline "$base..$onto" | head -20
 	exit 0
 fi
 
 if [[ "$behind" -eq 0 ]]; then
 	echo "already up to date with upstream."
 else
-	echo "==> rebasing $BRANCH onto $upstream_remote/main"
+	echo "==> rebasing $BRANCH onto $onto"
 	# --autostash: the Tauri build regenerates src-tauri/gen/schemas/*, so the
 	# worktree is almost never clean at sync time. Those are build artifacts;
 	# stashing and reapplying them is correct, not a workaround.
-	if ! git rebase --autostash "$upstream_remote/main" "$BRANCH"; then
+	if ! git rebase --autostash "$onto" "$BRANCH"; then
 		cat <<-'EOF'
 
 		Rebase stopped on a conflict. Resolve it, then:
@@ -79,7 +83,7 @@ fi
 
 cat <<-EOF
 
-Done. $BRANCH is now upstream/main + $ours local commit(s).
+Done. $BRANCH is now $onto + $ours local commit(s).
 
 Rebuild and reinstall:
     cd apps/screenpipe-app-tauri
