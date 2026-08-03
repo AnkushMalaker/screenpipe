@@ -14,6 +14,9 @@ on:
     branches:
       - "chronicle"
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: macos-26
@@ -180,3 +183,18 @@ jobs:
           path: apps/screenpipe-app-tauri/dist/screenpipe-nosignin-aarch64.dmg
           if-no-files-found: error
           retention-days: 14
+
+      # The viewer app rides on the rolling recorder release so a Mac has one
+      # place to fetch everything built from this branch. The release itself
+      # (tag position, manifest.json) is owned by chronicle-release.yml; this
+      # only replaces the dmg asset, so the two workflows cannot fight.
+      - name: Attach dmg to the rolling release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view chronicle-latest >/dev/null 2>&1; then
+            gh release upload chronicle-latest --clobber \
+              apps/screenpipe-app-tauri/dist/screenpipe-nosignin-aarch64.dmg
+          else
+            echo "chronicle-latest release not created yet; dmg stays an artifact this run"
+          fi

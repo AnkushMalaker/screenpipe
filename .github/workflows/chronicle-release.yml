@@ -1,0 +1,249 @@
+# Rolling prebuilt-recorder release for Chronicle capture nodes.
+#
+# Every push to `chronicle` rebuilds the CLI recorder for the platforms
+# Chronicle runs it on and republishes the results under the one rolling
+# prerelease tag `chronicle-latest`. Capture nodes never build the recorder
+# themselves: the Chronicle tray's "Update recorder" downloads the platform
+# asset from that release, swaps the installed binary, and restarts the
+# service (extras/chronicle-tray in the Chronicle repo).
+#
+# The build recipes are copied from upstream's release-cli.yml, minus
+# everything that needs upstream secrets (sccache R2, Sentry, Apple
+# codesigning/notarization — the cargo-produced ad-hoc signature is enough
+# for a binary a tray downloads outside quarantine). The recorder runs as a
+# CLI under systemd/launchd on capture nodes; the Tauri app is only the
+# optional viewer, published separately by custom-macos-dmg.yml.
+#
+# manifest.json on the release carries the fork commit and per-asset sha256s,
+# and is written by the single publish job so its contents can never race.
+
+name: Chronicle recorder release
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - "chronicle"
+
+# A superseded build must stop: its publish would move chronicle-latest
+# backwards after the newer run finished.
+concurrency:
+  group: chronicle-release
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+env:
+  GIT_LFS_SKIP_SMUDGE: 1
+  RELEASE_TAG: chronicle-latest
+
+jobs:
+  build-linux-cli:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config \
+            ffmpeg \
+            libavcodec-dev \
+            libavformat-dev \
+            libavutil-dev \
+            libswscale-dev \
+            libasound2-dev \
+            libdbus-1-dev \
+            libxcb1-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libtesseract-dev \
+            libssl-dev \
+            cmake \
+            build-essential \
+            clang \
+            libclang-dev \
+            libx11-dev \
+            libxi-dev \
+            libxext-dev \
+            libxtst-dev \
+            libxrandr-dev \
+            libxinerama-dev \
+            libxcursor-dev \
+            libxdo-dev \
+            libwayland-dev \
+            libpipewire-0.3-dev \
+            libgbm-dev \
+            libegl-dev \
+            libopenblas-dev
+          # antirez-asr-sys build script emits -llibopenblas (double lib prefix).
+          # Create a symlink so the linker can find it.
+          sudo mkdir -p /usr/lib/x86_64-linux-gnu/openblas/lib
+          sudo ln -sf /usr/lib/x86_64-linux-gnu/libopenblas.so /usr/lib/x86_64-linux-gnu/openblas/lib/liblibopenblas.so
+          sudo ln -sf /usr/lib/x86_64-linux-gnu/libopenblas.a /usr/lib/x86_64-linux-gnu/openblas/lib/liblibopenblas.a
+          echo "OPENBLAS_PATH=/usr/lib/x86_64-linux-gnu/openblas" >> $GITHUB_ENV
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: chronicle-cli-linux-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build CLI
+        run: |
+          cargo build --release -p screenpipe-engine --bin screenpipe --features redact-onnx-cpu --target x86_64-unknown-linux-gnu
+
+      - name: Package
+        run: |
+          # Same layout as upstream's npm CLI: the engine prepends its own bin/
+          # to PATH and points TESSDATA_PREFIX at bin/tessdata, so tesseract
+          # travels with the binary instead of depending on a system install.
+          mkdir -p pkg/bin
+          cp target/x86_64-unknown-linux-gnu/release/screenpipe pkg/bin/
+          for i in 1 2 3; do
+            curl -fsSL https://github.com/DanielMYT/tesseract-static/releases/download/tesseract-5.5.0/tesseract -o pkg/bin/tesseract && break || sleep $((5 * i))
+          done
+          chmod +x pkg/bin/tesseract
+          [ -s pkg/bin/tesseract ] || { echo "ERROR: bundled tesseract missing/empty"; exit 1; }
+          mkdir -p pkg/bin/tessdata
+          for i in 1 2 3; do
+            curl -fsSL https://github.com/tesseract-ocr/tessdata_fast/raw/4.1.0/eng.traineddata -o pkg/bin/tessdata/eng.traineddata && break || sleep $((5 * i))
+          done
+          [ -s pkg/bin/tessdata/eng.traineddata ] || { echo "ERROR: bundled eng.traineddata missing/empty"; exit 1; }
+          tar -czf screenpipe-cli-linux-x86_64.tar.gz -C pkg .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cli-linux-x86_64
+          path: screenpipe-cli-linux-x86_64.tar.gz
+
+  build-macos-cli:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+          cache: true
+          target: aarch64-apple-darwin
+          rustflags: ""
+
+      - name: Install dependencies
+        run: |
+          brew unlink pkg-config@0.29.2 || true
+          brew install ffmpeg pkg-config
+          brew link --overwrite pkg-config
+
+      - name: Build with Metal feature
+        run: |
+          export PKG_CONFIG_PATH="/usr/local/opt/ffmpeg/lib/pkgconfig:$PKG_CONFIG_PATH"
+          export PKG_CONFIG_ALLOW_CROSS=1
+          export RUSTFLAGS="-C link-arg=-Wl,-rpath,@executable_path/../lib -C link-arg=-Wl,-rpath,@loader_path/../lib"
+          # Fix i8mm build error - force M1 compatible architecture
+          # -U__ARM_FEATURE_MATMUL_INT8 undefines i8mm macro
+          # See: https://github.com/ggml-org/whisper.cpp/issues/3427
+          export CFLAGS="-mcpu=apple-m1 -U__ARM_FEATURE_MATMUL_INT8"
+          export CXXFLAGS="-mcpu=apple-m1 -U__ARM_FEATURE_MATMUL_INT8"
+          cargo build --release -p screenpipe-engine --bin screenpipe --features metal,parakeet-mlx,rfdetr-mlx,redact-onnx-coreml --target aarch64-apple-darwin
+
+      - name: Package
+        run: |
+          mkdir -p pkg/bin
+          cp target/aarch64-apple-darwin/release/screenpipe pkg/bin/
+          # MLX searches for mlx.metallib next to the binary at runtime; CI
+          # cmake uses JIT mode so it isn't compiled here. Upstream publishes a
+          # prebuilt one. Hard-fail if missing: parakeet-mlx without it breaks
+          # at runtime, which is worse than a visibly failed build.
+          curl -L -f -o pkg/bin/mlx.metallib \
+            "https://github.com/screenpipe/screenpipe/releases/download/mlx-metallib-v0.2.0/mlx.metallib"
+          [ -s pkg/bin/mlx.metallib ] || { echo "ERROR: mlx.metallib missing/empty"; exit 1; }
+          tar -czf screenpipe-cli-macos-aarch64.tar.gz -C pkg .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cli-macos-aarch64
+          path: screenpipe-cli-macos-aarch64.tar.gz
+
+  publish:
+    needs: [build-linux-cli, build-macos-cli]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          # Full history so `git describe` names the build like updates do
+          # everywhere else in Chronicle.
+          fetch-depth: 0
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Write manifest
+        run: |
+          describe=$(git describe --tags --always 2>/dev/null || git rev-parse --short HEAD)
+          cargo_version=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          python3 - "$GITHUB_SHA" "$describe" "$cargo_version" <<-'PY'
+          import hashlib, json, sys
+          from datetime import datetime, timezone
+
+          commit, describe, cargo_version = sys.argv[1:4]
+          assets = {}
+          for key, name in (
+              ("linux-x86_64", "screenpipe-cli-linux-x86_64.tar.gz"),
+              ("macos-aarch64", "screenpipe-cli-macos-aarch64.tar.gz"),
+          ):
+              digest = hashlib.sha256(open(name, "rb").read()).hexdigest()
+              assets[key] = {"name": name, "sha256": digest}
+          json.dump(
+              {
+                  "tag": "chronicle-latest",
+                  "commit": commit,
+                  "describe": describe,
+                  "cargo_version": cargo_version,
+                  "built_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                  "assets": assets,
+              },
+              open("manifest.json", "w"),
+              indent=1,
+          )
+          PY
+          cat manifest.json
+
+      - name: Publish rolling release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # The tag must follow the build or an old release serves stale
+          # binaries under a new commit. Force-move it, then upload with
+          # --clobber so asset names stay stable for the tray.
+          git tag -f "$RELEASE_TAG" "$GITHUB_SHA"
+          git push -f origin "refs/tags/$RELEASE_TAG"
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" \
+              --prerelease \
+              --title "Chronicle recorder (rolling)" \
+              --notes "Prebuilt \`screenpipe\` recorder from the \`chronicle\` branch. Updated on every push; installed by the Chronicle tray's \"Update recorder\"."
+          fi
+          gh release upload "$RELEASE_TAG" --clobber \
+            screenpipe-cli-linux-x86_64.tar.gz \
+            screenpipe-cli-macos-aarch64.tar.gz \
+            manifest.json
