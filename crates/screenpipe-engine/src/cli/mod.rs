@@ -455,6 +455,13 @@ pub struct ExportArgs {
 
 #[derive(Parser, Clone)]
 pub struct RecordArgs {
+    /// Use an exclusively managed recording policy instead of shared desktop settings.
+    #[arg(long)]
+    pub settings_file: Option<PathBuf>,
+
+    #[arg(skip)]
+    managed_settings: Option<ManagedRecordingSettings>,
+
     /// Audio chunk duration in seconds
     #[arg(short = 'd', long, default_value_t = 30)]
     pub audio_chunk_duration: u64,
@@ -924,6 +931,7 @@ pub struct RecordArgs {
 
 #[derive(Clone, Debug, Default)]
 pub struct RecordArgSources {
+    managed_conflicts: Vec<String>,
     pub audio_chunk_duration: bool,
     pub port: bool,
     pub disable_audio: bool,
@@ -987,7 +995,25 @@ impl RecordArgSources {
             return Self::default();
         };
 
+        let command = <Cli as clap::CommandFactory>::command();
+        let record_command = command
+            .find_subcommand("record")
+            .expect("record subcommand");
         Self {
+            managed_conflicts: record_command
+                .get_arguments()
+                .filter_map(|argument| {
+                    let name = argument.get_id().as_str();
+                    let explicit = matches!(
+                        record.value_source(name),
+                        Some(ValueSource::CommandLine | ValueSource::EnvVariable)
+                    );
+                    (explicit
+                        && !["settings_file", "data_dir", "api_auth", "auto_destruct_pid"]
+                            .contains(&name))
+                    .then(|| name.to_string())
+                })
+                .collect(),
             audio_chunk_duration: from_command_line(record, "audio_chunk_duration"),
             port: from_command_line(record, "port"),
             disable_audio: from_command_line(record, "disable_audio"),
@@ -1164,7 +1190,68 @@ fn parse_schedule_rule(s: &str) -> Result<screenpipe_config::ScheduleRule, Strin
     })
 }
 
+#[derive(Clone, serde::Deserialize)]
+struct ManagedRecordingSettings {
+    #[serde(flatten)]
+    recording: screenpipe_config::RecordingSettings,
+    #[serde(rename = "retentionDays")]
+    retention_days: u32,
+    #[serde(rename = "retentionMode")]
+    retention_mode: crate::retention::RetentionMode,
+}
+
 impl RecordArgs {
+    /// Load once before startup so capture and retention use the same policy snapshot.
+    pub fn prepare_managed_settings(&mut self, sources: &RecordArgSources) -> anyhow::Result<()> {
+        let Some(path) = self.settings_file.as_ref() else {
+            return Ok(());
+        };
+        anyhow::ensure!(
+            path.is_absolute(),
+            "--settings-file must be an absolute path"
+        );
+        anyhow::ensure!(
+            sources.managed_conflicts.is_empty(),
+            "--settings-file owns recording policy; remove conflicting options: {}",
+            sources.managed_conflicts.join(", ")
+        );
+        if self.managed_settings.is_some() {
+            return Ok(());
+        }
+        let value: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
+        let object = value
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("managed settings must be a JSON object"))?;
+        for key in [
+            "disableAudio",
+            "disableVision",
+            "disableScreenshots",
+            "audioTranscriptionEngine",
+            "retentionDays",
+            "retentionMode",
+        ] {
+            anyhow::ensure!(object.contains_key(key), "managed settings requires {key}");
+        }
+        for key in ["apiKey", "userId", "user"] {
+            anyhow::ensure!(!object.contains_key(key), "managed settings must not contain credentials ({key}); use the service environment");
+        }
+        let defaults = serde_json::to_value(screenpipe_config::RecordingSettings::default())?;
+        for key in object.keys() {
+            anyhow::ensure!(
+                defaults.get(key).is_some()
+                    || key == "deviceTier" // omitted when the default is None
+                    || key == "retentionDays"
+                    || key == "retentionMode",
+                "unknown managed recording setting: {key}"
+            );
+        }
+        let managed: ManagedRecordingSettings = serde_json::from_value(value)?;
+        self.retention_days = managed.retention_days;
+        self.retention_mode = managed.retention_mode;
+        self.managed_settings = Some(managed);
+        Ok(())
+    }
+
     fn combined_ignored_urls(&self) -> Vec<UrlRule> {
         self.ignored_urls
             .iter()
@@ -1333,10 +1420,24 @@ impl RecordArgs {
     /// If no `device_tier` is set in the config file, detects hardware and applies
     /// tier-appropriate defaults (first-launch behavior for CLI users).
     pub async fn into_recording_config(
-        self,
+        mut self,
         data_dir: PathBuf,
         sources: &RecordArgSources,
     ) -> anyhow::Result<crate::recording_config::RecordingConfig> {
+        self.prepare_managed_settings(sources)?;
+        if let Some(managed) = self.managed_settings.take() {
+            let mut config = crate::recording_config::RecordingConfig::from_settings(
+                &managed.recording,
+                data_dir,
+                None,
+            );
+            config.api_auth = self.api_auth || managed.recording.listen_on_lan;
+            if config.api_auth {
+                config.api_auth_key =
+                    Some(crate::auth_key::resolve_api_auth_key(&config.data_dir, None).await?);
+            }
+            return Ok(config);
+        }
         let cli_encryption_ready = if self.encrypt_secrets {
             match screenpipe_secrets::keychain::get_or_create_key() {
                 Some(_) => {
@@ -2668,6 +2769,93 @@ mod tests {
     fn record_sources<const N: usize>(args: [&str; N]) -> RecordArgSources {
         let matches = Cli::command().try_get_matches_from(args).unwrap();
         RecordArgSources::from_cli_matches(&matches)
+    }
+
+    fn managed_policy() -> serde_json::Value {
+        serde_json::json!({
+            "disableAudio": true, "disableVision": false, "disableScreenshots": false,
+            "audioTranscriptionEngine": "disabled", "ignoredWindows": ["Private"],
+            "analyticsEnabled": false, "deviceTier": "low", "retentionDays": 90, "retentionMode": "media"
+        })
+    }
+
+    #[tokio::test]
+    async fn managed_settings_own_capture_and_retention_without_shared_store() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("managed.json");
+        std::fs::write(&path, managed_policy().to_string()).unwrap();
+        let store = root.path().join("store.bin");
+        // Even an unreadable desktop store must be irrelevant in managed mode.
+        std::fs::write(&store, b"invalid desktop settings").unwrap();
+        std::fs::write(root.path().join("config.toml"), "invalid tier settings").unwrap();
+        let argv = [
+            "screenpipe",
+            "record",
+            "--settings-file",
+            path.to_str().unwrap(),
+            "--api-auth",
+            "false",
+        ];
+        let sources = record_sources(argv);
+        let mut args = record_args(argv);
+        args.prepare_managed_settings(&sources).unwrap();
+        assert_eq!(args.retention_days, 90);
+        assert_eq!(args.retention_mode, crate::retention::RetentionMode::Media);
+        // Capture must use the same snapshot even if the file changes during startup.
+        std::fs::write(&path, "{}").unwrap();
+        let config = args
+            .into_recording_config(root.path().into(), &sources)
+            .await
+            .unwrap();
+        assert!(config.disable_audio);
+        assert!(!config.disable_vision);
+        assert_eq!(config.ignored_windows, vec!["Private"]);
+        assert!(!config.analytics_enabled);
+        assert_eq!(std::fs::read(&store).unwrap(), b"invalid desktop settings");
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("config.toml")).unwrap(),
+            "invalid tier settings"
+        );
+    }
+
+    #[test]
+    fn managed_settings_reject_mixed_policy_and_incomplete_files() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("managed.json");
+        std::fs::write(&path, managed_policy().to_string()).unwrap();
+        let argv = [
+            "screenpipe",
+            "record",
+            "--settings-file",
+            path.to_str().unwrap(),
+            "--disable-audio",
+        ];
+        assert!(record_args(argv)
+            .prepare_managed_settings(&record_sources(argv))
+            .unwrap_err()
+            .to_string()
+            .contains("conflicting"));
+        let argv = [
+            "screenpipe",
+            "record",
+            "--settings-file",
+            path.to_str().unwrap(),
+        ];
+        for (key, value) in [
+            ("unknownPolicy", serde_json::json!(true)),
+            ("apiKey", serde_json::json!("secret")),
+        ] {
+            let mut policy = managed_policy();
+            policy[key] = value;
+            std::fs::write(&path, policy.to_string()).unwrap();
+            assert!(record_args(argv)
+                .prepare_managed_settings(&record_sources(argv))
+                .is_err());
+        }
+        std::fs::write(&path, "{}").unwrap();
+        assert!(record_args(argv)
+            .prepare_managed_settings(&record_sources(argv))
+            .is_err());
     }
 
     #[tokio::test]

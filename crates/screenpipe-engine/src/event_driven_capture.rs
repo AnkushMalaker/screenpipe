@@ -966,7 +966,10 @@ fn record_persisted_capture(
     aggregate: &screenpipe_screen::PipelineMetrics,
     monitor: &screenpipe_screen::PipelineMetrics,
     duration: Duration,
+    image_timestamp: Option<u64>,
 ) {
+    aggregate.record_image_outcome(image_timestamp);
+    monitor.record_image_outcome(image_timestamp);
     aggregate.record_capture();
     aggregate.record_db_write(duration);
     monitor.record_capture();
@@ -1005,6 +1008,8 @@ fn record_capture_skip(
     corrupt_is_green: Option<bool>,
 ) {
     if let Some(is_green) = corrupt_is_green {
+        aggregate.record_image_outcome(None);
+        monitor.record_image_outcome(None);
         aggregate.record_corrupt_skip(is_green);
         monitor.record_corrupt_skip(is_green);
     } else {
@@ -1253,6 +1258,8 @@ pub(crate) async fn event_driven_capture_loop(
                         &vision_metrics,
                         &monitor_liveness,
                         Duration::from_millis(result.duration_ms),
+                        (!result.snapshot_path.is_empty())
+                            .then_some(result.captured_at.timestamp().max(0) as u64),
                     );
                     record_ocr_result_metrics(&vision_metrics, result);
                     if let Some(ref cache) = hot_frame_cache {
@@ -1280,9 +1287,13 @@ pub(crate) async fn event_driven_capture_loop(
                 }
             }
             Ok(Err(e)) => {
+                vision_metrics.record_image_outcome(None);
+                monitor_liveness.record_image_outcome(None);
                 warn!("startup capture failed for monitor {}: {}", monitor_id, e);
             }
             Err(_timeout) => {
+                vision_metrics.record_image_outcome(None);
+                monitor_liveness.record_image_outcome(None);
                 warn!(
                     "startup capture timed out after {:?} for monitor {}; continuing with live capture loop",
                     CAPTURE_OPERATION_TIMEOUT, monitor_id
@@ -2227,6 +2238,8 @@ pub(crate) async fn event_driven_capture_loop(
                                 &vision_metrics,
                                 &monitor_liveness,
                                 Duration::from_millis(result.duration_ms),
+                                (!result.snapshot_path.is_empty())
+                                    .then_some(result.captured_at.timestamp().max(0) as u64),
                             );
                             record_ocr_result_metrics(&vision_metrics, result);
                             // OCR-gate telemetry (#5054/#5060): decision counters
@@ -2331,6 +2344,8 @@ pub(crate) async fn event_driven_capture_loop(
                         }
                     }
                     Ok(Err(e)) => {
+                        vision_metrics.record_image_outcome(None);
+                        monitor_liveness.record_image_outcome(None);
                         consecutive_capture_errors += 1;
 
                         // Mark captured on failure to reset idle timer — without
@@ -2386,6 +2401,8 @@ pub(crate) async fn event_driven_capture_loop(
                         }
                     }
                     Err(_timeout) => {
+                        vision_metrics.record_image_outcome(None);
+                        monitor_liveness.record_image_outcome(None);
                         consecutive_capture_errors += 1;
                         state.mark_captured();
 
@@ -4879,13 +4896,28 @@ mod tests {
     }
 
     #[test]
+    fn metadata_and_heartbeats_never_claim_persisted_images() {
+        let aggregate = screenpipe_screen::PipelineMetrics::new();
+        let monitor = screenpipe_screen::PipelineMetrics::new();
+        record_persisted_capture(&aggregate, &monitor, Duration::ZERO, None);
+        record_capture_loop_heartbeat(&aggregate, &monitor);
+        record_capture_skip(&aggregate, &monitor, None);
+        assert_eq!(monitor.image_capture_snapshot(), (0, 2));
+        record_persisted_capture(&aggregate, &monitor, Duration::ZERO, Some(123));
+        assert_eq!(monitor.image_capture_snapshot(), (123, 1));
+        record_persisted_capture(&aggregate, &monitor, Duration::ZERO, None);
+        assert_eq!(monitor.image_capture_snapshot(), (123, 2));
+        assert_eq!(aggregate.image_capture_snapshot(), (123, 2));
+    }
+
+    #[test]
     fn aggregate_and_per_monitor_liveness_advance_together() {
         let aggregate = screenpipe_screen::PipelineMetrics::new();
         let monitor = screenpipe_screen::PipelineMetrics::new();
 
         record_capture_loop_heartbeat(&aggregate, &monitor);
         record_capture_attempt(&aggregate, &monitor);
-        record_persisted_capture(&aggregate, &monitor, Duration::from_millis(7));
+        record_persisted_capture(&aggregate, &monitor, Duration::from_millis(7), None);
         record_capture_attempt(&aggregate, &monitor);
         record_capture_skip(&aggregate, &monitor, None);
         record_capture_attempt(&aggregate, &monitor);

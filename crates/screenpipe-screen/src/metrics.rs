@@ -291,6 +291,10 @@ pub struct PipelineMetrics {
     // --- Timestamps ---
     /// Unix timestamp (secs) of most recent DB write — used by health check to avoid DB queries
     pub last_db_write_ts: AtomicU64,
+    /// Timestamp of an image durably associated with a capture, never a heartbeat.
+    last_image_write_ts: AtomicU64,
+    /// 0: no outcome, 1: stored image, 2: metadata without an image.
+    image_outcome: AtomicU8,
     /// Unix timestamp (secs) of the most recent capture operation. This proves
     /// capture work is being issued, but unlike the loop heartbeat it may stay
     /// flat during intentional focus-aware idling.
@@ -366,6 +370,8 @@ impl PipelineMetrics {
             video_queue_depth: AtomicU64::new(0),
             pipeline_stall_count: AtomicU64::new(0),
             last_db_write_ts: AtomicU64::new(0),
+            last_image_write_ts: AtomicU64::new(0),
+            image_outcome: AtomicU8::new(0),
             last_capture_attempt_ts: AtomicU64::new(0),
             last_capture_loop_heartbeat_ts: AtomicU64::new(0),
             capture_loop_heartbeats: AtomicU64::new(0),
@@ -443,6 +449,20 @@ impl PipelineMetrics {
     /// Effective screenshot-capture state last published by the capture loop.
     pub fn screenshot_capture_state(&self) -> ScreenshotCaptureState {
         ScreenshotCaptureState::from_u8(self.screenshot_capture_state.load(Ordering::Relaxed))
+    }
+
+    /// Called only after the capture writer commits its result.
+    pub fn record_image_outcome(&self, timestamp: Option<u64>) {
+        if let Some(timestamp) = timestamp {
+            self.last_image_write_ts.store(timestamp, Ordering::Relaxed);
+        }
+        self.image_outcome
+            .store(if timestamp.is_some() { 1 } else { 2 }, Ordering::Release);
+    }
+
+    pub fn image_capture_snapshot(&self) -> (u64, u8) {
+        let outcome = self.image_outcome.load(Ordering::Acquire);
+        (self.last_image_write_ts.load(Ordering::Relaxed), outcome)
     }
 
     /// Record that a frame was skipped by similarity check.

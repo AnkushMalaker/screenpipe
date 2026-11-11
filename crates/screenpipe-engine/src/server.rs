@@ -1119,6 +1119,7 @@ impl SCServer {
                 "/cloud-agents/cursor-key",
                 crate::routes::cloud_agents::set_cursor_cloud_key,
             )
+            .get("/app-runs", crate::routes::app_runs::get_app_runs)
             // Vault routes
             .get("/vault/status", crate::routes::vault::vault_status)
             .post("/vault/lock", crate::routes::vault::vault_lock)

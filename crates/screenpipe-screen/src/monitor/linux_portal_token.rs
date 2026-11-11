@@ -22,7 +22,6 @@
 use std::{
     fs,
     io::{self, Write},
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
 };
 
@@ -76,12 +75,39 @@ impl RestoreTokenStore {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let tmp = self.path.with_extension("tmp");
-        let result = write_private(&tmp, &token).and_then(|()| fs::rename(&tmp, &self.path));
-        if result.is_err() {
-            let _ = fs::remove_file(&tmp);
+        let parent = self
+            .path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let mut pending = tempfile::NamedTempFile::new_in(parent)?;
+        pending.write_all(token.as_bytes())?;
+        pending.as_file().sync_all()?;
+        pending.persist(&self.path)?;
+        fs::File::open(parent)?.sync_all()
+    }
+
+    /// Atomically claim a single-use token. A cancelled request or a missing
+    /// replacement requires fresh consent; two processes cannot claim it twice.
+    pub(super) fn take(&self) -> io::Result<Option<String>> {
+        let parent = self
+            .path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let claimed = match tempfile::NamedTempFile::new_in(parent) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        match fs::rename(&self.path, claimed.path()) {
+            Ok(()) => {
+                fs::File::open(parent)?.sync_all()?;
+                Ok(sanitize_token(&fs::read_to_string(claimed.path())?))
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
         }
-        result
     }
 
     /// Deletes the persisted token. A missing file is not an error.
@@ -101,23 +127,25 @@ fn sanitize_token(raw: &str) -> Option<String> {
     well_formed.then(|| token.to_string())
 }
 
-/// Creates (or truncates) `path` with mode `0600` and writes `contents`.
-fn write_private(path: &Path, contents: &str) -> io::Result<()> {
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)?;
-    // `mode` only applies on creation; tighten a pre-existing temp file too.
-    file.set_permissions(fs::Permissions::from_mode(0o600))?;
-    file.write_all(contents.as_bytes())?;
-    file.sync_all()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn token_can_only_be_claimed_once_across_concurrent_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_in(&dir);
+        store.save("single-use").unwrap();
+        let tokens = std::thread::scope(|scope| {
+            let a = scope.spawn(|| store.take().unwrap());
+            let b = scope.spawn(|| store.take().unwrap());
+            [a.join().unwrap(), b.join().unwrap()]
+        });
+        assert_eq!(tokens.iter().flatten().count(), 1);
+        assert_eq!(store.take().unwrap(), None);
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
 
     fn store_in(dir: &tempfile::TempDir) -> RestoreTokenStore {
         RestoreTokenStore::in_dir(dir.path())

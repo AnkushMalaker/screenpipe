@@ -5,6 +5,7 @@
 pub mod activity_ledger;
 pub mod activity_summary;
 pub mod ai_feedback;
+pub mod app_runs;
 pub mod artifacts;
 pub mod audio;
 pub mod browser;

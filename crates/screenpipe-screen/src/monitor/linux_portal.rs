@@ -34,7 +34,7 @@ use std::{
     os::fd::OwnedFd,
     rc::Rc,
     sync::{
-        atomic::{AtomicU64, AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
         Arc, Condvar, Mutex, Weak,
     },
     thread,
@@ -111,6 +111,7 @@ struct PortalShared {
     generation: AtomicU64,
     lifecycle: AsyncMutex<()>,
     monitors: Mutex<HashMap<u32, MonitorDescriptor>>,
+    layout_enumerated: AtomicBool,
     node_by_monitor: Mutex<HashMap<u32, u32>>,
     active_requests: Mutex<HashMap<u32, usize>>,
     frames: Mutex<HashMap<u32, PortalFrame>>,
@@ -147,6 +148,7 @@ impl PortalShared {
             generation: AtomicU64::new(0),
             lifecycle: AsyncMutex::new(()),
             monitors: Mutex::new(HashMap::new()),
+            layout_enumerated: AtomicBool::new(false),
             node_by_monitor: Mutex::new(HashMap::new()),
             active_requests: Mutex::new(HashMap::new()),
             frames: Mutex::new(HashMap::new()),
@@ -164,10 +166,24 @@ impl PortalShared {
         self.restore_token.lock().unwrap().clone()
     }
 
+    /// Claim the single-use token immediately before SelectSources. Disk is the
+    /// authority when configured: another process may already have claimed it.
+    fn take_restore_token(&self) -> Option<String> {
+        let mut cached = self.restore_token.lock().unwrap();
+        let memory_token = cached.take();
+        match &self.token_store {
+            Some(store) => store.take().unwrap_or_else(|error| {
+                tracing::warn!(%error, "could not consume Wayland screen-share restore token; requesting fresh consent");
+                None
+            }),
+            None => memory_token,
+        }
+    }
+
     /// Records the token the portal returned after `Start` and persists it.
-    /// Portals may omit the token (e.g. the user declined persistence), in
-    /// which case the previous one is kept. Persistence failures only log:
-    /// capture must never fail because the token could not be saved.
+    /// Portals may omit the replacement token; the previous token was already
+    /// consumed before SelectSources and must never be replayed. Persistence
+    /// failures only log: capture must never fail because saving failed.
     fn remember_restore_token(&self, token: Option<&str>) {
         let Some(token) = token else {
             return;
@@ -254,6 +270,7 @@ impl PortalCaptureSession {
 
         let changed = {
             let mut current = self.shared.monitors.lock().unwrap();
+            self.shared.layout_enumerated.store(true, Ordering::Release);
             if *current == layout {
                 false
             } else {
@@ -273,11 +290,12 @@ impl PortalCaptureSession {
     }
 
     pub(super) fn register_monitor(self: &Arc<Self>, monitor_id: u32, data: MonitorData) {
-        self.shared
-            .monitors
-            .lock()
-            .unwrap()
-            .insert(monitor_id, MonitorDescriptor::new(monitor_id, data));
+        let mut monitors = self.shared.monitors.lock().unwrap();
+        // Enumeration owns the complete topology; old capture handles must not
+        // restore stale positions or reintroduce a disconnected display.
+        if !self.shared.layout_enumerated.load(Ordering::Acquire) {
+            monitors.insert(monitor_id, MonitorDescriptor::new(monitor_id, data));
+        }
     }
 
     pub(super) fn begin_capture(
@@ -287,20 +305,8 @@ impl PortalCaptureSession {
     ) -> Result<PortalCaptureRequest> {
         self.register_monitor(monitor_id, data);
 
-        if self.shared.phase.load(Ordering::Acquire) == PORTAL_RUNNING
-            && !self
-                .shared
-                .node_by_monitor
-                .lock()
-                .unwrap()
-                .contains_key(&monitor_id)
-        {
-            tracing::info!(
-                "monitor {} is not in the active Wayland portal session; rebuilding it",
-                monitor_id
-            );
-            self.invalidate_current();
-        }
+        // A partial portal selection is valid. An unselected display must not
+        // invalidate the working streams; enumeration handles topology changes.
 
         *self
             .shared
@@ -573,7 +579,7 @@ async fn run_portal_session(
         _ = wait_for_cancellation(&mut shutdown_rx, &mut generation_rx, generation) => return Ok(()),
     };
 
-    let restore_token = shared.current_restore_token();
+    let restore_token = shared.take_restore_token();
     let select_request = tokio::select! {
         result = screencast.select_sources(
             &session,
@@ -1213,6 +1219,78 @@ mod tests {
         }
     }
 
+    fn test_session() -> Arc<PortalCaptureSession> {
+        let (shutdown_tx, _) = watch::channel(false);
+        let (generation_tx, _) = watch::channel(7);
+        let shared = Arc::new(PortalShared::default());
+        shared.generation.store(7, Ordering::Release);
+        shared.phase.store(PORTAL_RUNNING, Ordering::Release);
+        shared.node_by_monitor.lock().unwrap().insert(1, 11);
+        Arc::new(PortalCaptureSession {
+            shared,
+            shutdown_tx,
+            generation_tx,
+        })
+    }
+
+    fn data(x: i32) -> MonitorData {
+        MonitorData {
+            width: 1920,
+            height: 1080,
+            x,
+            y: 0,
+            name: "display".into(),
+            is_primary: x == 0,
+        }
+    }
+
+    #[test]
+    fn repeated_unselected_capture_preserves_selected_session() {
+        let session = test_session();
+        for _ in 0..100 {
+            let request = session.begin_capture(2, data(1920)).unwrap();
+            let error = session
+                .wait_for_frame_after(2, None, Duration::ZERO, request)
+                .unwrap_err();
+            assert!(error.to_string().contains("was not selected"));
+            assert_eq!(session.shared.generation.load(Ordering::Acquire), 7);
+            assert_eq!(session.shared.phase.load(Ordering::Acquire), PORTAL_RUNNING);
+            assert_eq!(
+                session.shared.node_by_monitor.lock().unwrap().get(&1),
+                Some(&11)
+            );
+        }
+        let request = session.begin_capture(1, data(0)).unwrap();
+        store_frame(&session.shared, 1, 1, 1, vec![1, 2, 3, 255]);
+        let frame = session
+            .wait_for_frame_after(1, None, Duration::ZERO, request)
+            .unwrap();
+        assert_eq!(frame.width(), 1);
+        assert!(session.shared.active_requests.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn stale_capture_handles_cannot_overwrite_enumerated_layout() {
+        let session = test_session();
+        session
+            .shared
+            .monitors
+            .lock()
+            .unwrap()
+            .insert(1, monitor(1, 1920, 1920, "display"));
+        session
+            .shared
+            .layout_enumerated
+            .store(true, Ordering::Release);
+        let request = session.begin_capture(1, data(0)).unwrap();
+        session.register_monitor(99, data(0));
+        let monitors = session.shared.monitors.lock().unwrap();
+        assert_eq!(monitors.len(), 1);
+        assert_eq!(monitors[&1].x, 1920);
+        drop(monitors);
+        drop(request);
+    }
+
     #[test]
     fn maps_multiple_streams_by_monitor_position() {
         let monitors = vec![monitor(1, 0, 1920, "left"), monitor(2, 1920, 1920, "right")];
@@ -1404,13 +1482,14 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_returned_token_keeps_the_previous_one() {
+    fn a_missing_returned_token_does_not_replay_the_consumed_one() {
         let dir = tempfile::tempdir().unwrap();
         let (shared, store) = shared_with_store(&dir);
-        shared.remember_restore_token(Some("kept"));
+        shared.remember_restore_token(Some("single-use"));
+        assert_eq!(shared.take_restore_token().as_deref(), Some("single-use"));
         shared.remember_restore_token(None);
-        assert_eq!(shared.current_restore_token().as_deref(), Some("kept"));
-        assert_eq!(store.load().as_deref(), Some("kept"));
+        assert_eq!(shared.take_restore_token(), None);
+        assert_eq!(store.load(), None);
     }
 
     #[test]

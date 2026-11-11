@@ -1517,7 +1517,8 @@ impl DatabaseManager {
 
     /// Attempt the same sampled, coordinated maintenance used by the hourly
     /// background task. Start only with an idle writer and yield between tables;
-    /// an analysis already running finishes before waiting writes proceed.
+    /// an active slice drains in SQLite before waiting writes proceed, with
+    /// long operations interrupted by the recording-latency budget.
     pub async fn maintain_planner_statistics(&self) -> crate::planner_stats::Attempt {
         crate::planner_stats::run_and_report(
             &self.write_pool,

@@ -118,6 +118,21 @@ fn local_retention_configure_url(port: u16) -> String {
     format!("http://127.0.0.1:{port}/retention/configure")
 }
 
+fn startup_retention_policy(
+    managed: bool,
+    days: u32,
+    mode: screenpipe_engine::retention::RetentionMode,
+) -> Option<serde_json::Value> {
+    if days > 0 {
+        Some(serde_json::json!({"enabled": true, "retention_days": days, "mode": mode}))
+    } else if managed {
+        // The endpoint rejects a zero retention_days even for disable requests.
+        Some(serde_json::json!({"enabled": false, "mode": mode}))
+    } else {
+        None
+    }
+}
+
 fn with_local_api_auth(
     request: reqwest::RequestBuilder,
     api_auth_key: Option<&str>,
@@ -343,7 +358,7 @@ async fn run(cli: Cli, record_arg_sources: RecordArgSources) -> anyhow::Result<(
 
     debug!("starting screenpipe server");
     // Dispatch subcommands — non-recording commands return early
-    let record_args = match cli.command {
+    let mut record_args = match cli.command {
         Command::Status {
             json,
             ref data_dir,
@@ -531,6 +546,8 @@ async fn run(cli: Cli, record_arg_sources: RecordArgSources) -> anyhow::Result<(
         Command::Record(args) => args,
     };
 
+    record_args.prepare_managed_settings(&record_arg_sources)?;
+
     let stop_requested = wait_for_cli_stop(record_args.auto_destruct_pid);
     pin_mut!(stop_requested);
     let local_data_dir = loop {
@@ -555,7 +572,9 @@ async fn run(cli: Cli, record_arg_sources: RecordArgSources) -> anyhow::Result<(
     // One-time, TTY-only equivalent of the desktop onboarding's "connect all
     // your AI tools" card. It detects local agents and reuses `agent setup`,
     // so CLI and app installs share the same MCP + skills layout.
-    screenpipe_engine::cli::agent::maybe_prompt_connect_detected(&local_data_dir);
+    if record_args.settings_file.is_none() {
+        screenpipe_engine::cli::agent::maybe_prompt_connect_detected(&local_data_dir);
+    }
 
     // Build unified RecordingConfig from shared app settings plus explicit CLI args.
     let mut config = record_args
@@ -1710,14 +1729,16 @@ async fn run(cli: Cli, record_arg_sources: RecordArgSources) -> anyhow::Result<(
     if config.api_auth {
         pipe_manager.set_local_api_key(config.api_auth_key.clone());
     }
-    pipe_manager.install_builtin_pipes().ok();
-    if let Err(e) = pipe_manager.load_pipes().await {
-        tracing::warn!("failed to load pipes: {}", e);
-    }
-    // Mark any executions left 'running' from a previous crash as failed
-    pipe_manager.startup_recovery().await;
-    if let Err(e) = pipe_manager.start_scheduler().await {
-        tracing::warn!("failed to start pipe scheduler: {}", e);
+    if record_args.settings_file.is_none() {
+        pipe_manager.install_builtin_pipes().ok();
+        if let Err(e) = pipe_manager.load_pipes().await {
+            tracing::warn!("failed to load pipes: {}", e);
+        }
+        // Mark any executions left 'running' from a previous crash as failed
+        pipe_manager.startup_recovery().await;
+        if let Err(e) = pipe_manager.start_scheduler().await {
+            tracing::warn!("failed to start pipe scheduler: {}", e);
+        }
     }
     let shared_pipe_manager = std::sync::Arc::new(tokio::sync::Mutex::new(pipe_manager));
     let server = server
@@ -1725,12 +1746,15 @@ async fn run(cli: Cli, record_arg_sources: RecordArgSources) -> anyhow::Result<(
         .with_mcp_session_access(mcp_session_access)
         .with_high_fps_controller(high_fps_controller.clone());
 
-    // Install pi agent in background
-    tokio::spawn(async move {
-        if let Err(e) = pi_executor.ensure_installed().await {
-            tracing::warn!("pi agent install failed: {}", e);
-        }
-    });
+    // Managed recording leaves agent installation and scheduled processing to its owner.
+    if record_args.settings_file.is_none() {
+        // Install pi agent in background
+        tokio::spawn(async move {
+            if let Err(e) = pi_executor.ensure_installed().await {
+                tracing::warn!("pi agent install failed: {}", e);
+            }
+        });
+    }
 
     // print screenpipe in gradient
     println!("\n\n{}", DISPLAY.truecolor(147, 112, 219).bold());
@@ -2105,27 +2129,26 @@ async fn run(cli: Cli, record_arg_sources: RecordArgSources) -> anyhow::Result<(
         let api_auth_key = config.api_auth_key.clone();
         let retention_days = record_args.retention_days;
         let retention_mode = record_args.retention_mode;
-        let retention_enabled = retention_days > 0;
+        let retention_policy = startup_retention_policy(
+            record_args.settings_file.is_some(),
+            retention_days,
+            retention_mode,
+        );
         tokio::spawn(async move {
-            if !retention_enabled {
-                tracing::info!("local retention disabled (--retention-days 0)");
+            let Some(retention_policy) = retention_policy else {
                 return;
-            }
+            };
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             let client = reqwest::Client::new();
             let url = local_retention_configure_url(port);
             let request = with_local_api_auth(
-                client.post(&url).json(&serde_json::json!({
-                    "enabled": true,
-                    "retention_days": retention_days,
-                    "mode": retention_mode,
-                })),
+                client.post(&url).json(&retention_policy),
                 api_auth_key.as_deref(),
             );
             match request.send().await {
                 Ok(r) if r.status().is_success() => {
                     tracing::info!(
-                        "local retention auto-enabled ({} days, mode={:?})",
+                        "local retention configured ({} days; zero disables, mode={:?})",
                         retention_days,
                         retention_mode
                     );
@@ -2133,10 +2156,10 @@ async fn run(cli: Cli, record_arg_sources: RecordArgSources) -> anyhow::Result<(
                 Ok(r) => {
                     let status = r.status();
                     let body = r.text().await.unwrap_or_default();
-                    tracing::warn!("local retention auto-enable failed ({}): {}", status, body);
+                    tracing::warn!("local retention configure failed ({}): {}", status, body);
                 }
                 Err(e) => {
-                    tracing::warn!("local retention auto-enable request failed: {}", e);
+                    tracing::warn!("local retention configure request failed: {}", e);
                 }
             }
         });
@@ -2548,6 +2571,17 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), wait_for_cli_stop(Some(pid)))
             .await
             .expect("parent termination must stop a database retry without Ctrl+C");
+    }
+
+    #[test]
+    fn managed_retention_zero_explicitly_disables_prior_policy() {
+        use screenpipe_engine::retention::RetentionMode;
+        let request = startup_retention_policy(true, 0, RetentionMode::Media).unwrap();
+        let parsed: screenpipe_engine::retention::RetentionConfigureRequest =
+            serde_json::from_value(request).unwrap();
+        assert_eq!(parsed.enabled, Some(false));
+        assert_eq!(parsed.retention_days, None);
+        assert!(startup_retention_policy(false, 0, RetentionMode::Media).is_none());
     }
 
     #[test]

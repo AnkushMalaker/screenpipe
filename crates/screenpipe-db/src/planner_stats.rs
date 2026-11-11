@@ -17,7 +17,10 @@ use tokio_util::sync::CancellationToken;
 pub(crate) const INTERVAL: Duration = Duration::from_secs(3600);
 // SQLite recommends approximate ANALYZE with 100–1000 sampled rows per index;
 // 1000 also repaired the reported production plan. This bounds sampling, not
-// elapsed time: counting index pages may take longer and must be allowed to finish.
+// elapsed time: counting index pages can still block recording for minutes.
+// Allow ordinary sampled repairs to finish, but yield long native operations
+// well before capture's 15-second operation deadline.
+const SLICE_BUDGET: Duration = Duration::from_secs(2);
 const ANALYSIS_LIMIT: i64 = 1000;
 const FILE: &str = "sqlite-planner-maintenance.json";
 
@@ -156,20 +159,27 @@ pub(crate) async fn slice(
 }
 
 // SQLite's B-tree count can run inside a single VM opcode. A progress
-// handler alone cannot interrupt it during shutdown. sqlite3_interrupt is thread-safe;
+// handler alone cannot interrupt it during shutdown or at the time budget.
+// sqlite3_interrupt is thread-safe;
 // this guard synchronizes its lifetime with the owned connection, including
 // unwinding, so cancellation cannot interrupt a later borrower or freed handle.
-struct InterruptOnShutdown {
+struct InterruptMaintenance {
     target: Arc<Mutex<Option<usize>>>,
     watcher: tokio::task::JoinHandle<()>,
 }
 
-impl InterruptOnShutdown {
+impl InterruptMaintenance {
     fn new(raw: usize, shutdown: CancellationToken) -> Self {
         let target = Arc::new(Mutex::new(Some(raw)));
         let watcher_target = Arc::clone(&target);
         let watcher = tokio::spawn(async move {
-            shutdown.cancelled().await;
+            tokio::select! {
+                _ = shutdown.cancelled() => {}
+                _ = tokio::time::sleep(SLICE_BUDGET) => {
+                    tracing::info!(budget_ms = SLICE_BUDGET.as_millis(),
+                        "planner maintenance slice interrupted at recording budget");
+                }
+            }
             let guard = watcher_target.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(raw) = *guard {
                 // SAFETY: Drop clears the pointer under this same lock before
@@ -183,7 +193,7 @@ impl InterruptOnShutdown {
     }
 }
 
-impl Drop for InterruptOnShutdown {
+impl Drop for InterruptMaintenance {
     fn drop(&mut self) {
         *self.target.lock().unwrap_or_else(|e| e.into_inner()) = None;
         self.watcher.abort();
@@ -211,7 +221,7 @@ async fn on_connection(
         handle.set_progress_handler(1000, move || !cancel.is_cancelled());
         handle.as_raw_handle().as_ptr() as usize
     };
-    let watcher = InterruptOnShutdown::new(raw, shutdown.clone());
+    let watcher = InterruptMaintenance::new(raw, shutdown.clone());
     let result = work(conn, analyze).await;
     drop(watcher);
     if let Err(error) = &result {
@@ -403,4 +413,53 @@ pub(crate) async fn run(
     }
     attempt.duration_ms = started.elapsed().as_millis() as u64;
     attempt
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn native_budget_interrupts_work_before_releasing_capture_writer() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let gate = Arc::new(Semaphore::new(1));
+        let health = crate::write_queue::WriteQueueHealth::default();
+        let shutdown = CancellationToken::new();
+        let start = Instant::now();
+        let error = slice(&pool, &gate, &health, &shutdown,
+            Some("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<1000000000) SELECT sum(x) FROM n"))
+            .await.unwrap_err();
+        assert!(crate::is_sqlite_interrupt(&error), "{error}");
+        assert!(start.elapsed() >= SLICE_BUDGET);
+        assert!(start.elapsed() < Duration::from_secs(5));
+        assert!(!shutdown.is_cancelled());
+        let _capture_permit = gate.acquire().await.unwrap();
+        sqlx::query("CREATE TABLE captures(id INTEGER)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO captures VALUES (1)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM captures")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("PRAGMA analysis_limit")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0
+        );
+        pool.close().await;
+    }
 }

@@ -19,13 +19,6 @@ pub(crate) async fn capture_filtered(
     sources: ExclusionSources,
     _fresh: bool,
 ) -> anyhow::Result<DynamicImage> {
-    // XWayland cannot enumerate native Wayland surfaces. Never fall back to a
-    // portal/monitor image when isolated pixels are required.
-    ensure!(
-        std::env::var_os("WAYLAND_DISPLAY").is_none()
-            && std::env::var("XDG_SESSION_TYPE").unwrap_or_default() != "wayland",
-        "window-filtered screenshots require X11 window surfaces"
-    );
     let permit = tokio::time::timeout(Duration::from_secs(1), CAPTURE_SLOT.clone().acquire_owned())
         .await
         .map_err(|_| anyhow!("window-filtered capture is still busy"))??;
@@ -33,7 +26,13 @@ pub(crate) async fn capture_filtered(
     let filters = filters.clone();
     let work = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        capture(&monitor, &filters, sources)
+        if std::env::var_os("WAYLAND_DISPLAY").is_some()
+            || std::env::var("XDG_SESSION_TYPE").unwrap_or_default() == "wayland"
+        {
+            super::linux_wayland::capture(&monitor, &filters, sources)
+        } else {
+            capture(&monitor, &filters, sources)
+        }
     });
     tokio::time::timeout(Duration::from_secs(5), work)
         .await

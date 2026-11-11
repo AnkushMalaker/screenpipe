@@ -22,6 +22,11 @@ CMAKE_POLICY_VERSION_MINIMUM = "3.5"
 # into the already-bundled SQLite library so recovery never depends on a host
 # `sqlite3` executable or platform package manager.
 LIBSQLITE3_FLAGS = "SQLITE_ENABLE_DBPAGE_VTAB"
+# antirez-asr-sys uses strict C11, which hides POSIX strdup declarations on
+# glibc. GCC 14+ rejects the resulting implicit declaration. Expose the GNU/POSIX
+# declarations for Linux C dependencies without changing their language mode.
+# Keep this target-scoped so other platforms retain their compiler defaults.
+CFLAGS_x86_64_unknown_linux_gnu = { value = "-D_GNU_SOURCE", force = false }
 
 # Cargo already uses the machine's available parallelism. A fixed value made
 # 10-core developer machines run 16 compiler processes at once, increasing

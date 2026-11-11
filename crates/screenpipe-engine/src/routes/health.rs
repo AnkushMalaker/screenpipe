@@ -700,6 +700,42 @@ pub struct MonitorInfo {
     pub is_default: bool,
 }
 
+/// Image health is based on committed pixel-bearing captures, not loop or text activity.
+fn classify_image_capture(
+    disabled: bool,
+    expected: bool,
+    screenshot_state: screenpipe_screen::ScreenshotCaptureState,
+    frame_status: &str,
+    outcomes: &[(u32, u64, u8)],
+) -> (&'static str, &'static str) {
+    use screenpipe_screen::ScreenshotCaptureState as S;
+    if disabled {
+        return ("disabled", "disabled_by_setting");
+    }
+    if !expected {
+        return ("idle", "no_displays_expected");
+    }
+    match screenshot_state {
+        S::DisabledByConfig => return ("disabled", "screenshots_disabled_by_config"),
+        S::DisabledByPowerProfile => return ("idle", "screenshots_disabled_by_power_profile"),
+        S::Enabled => {}
+    }
+    if outcomes.iter().any(|(_, _, outcome)| *outcome == 2) {
+        return ("error", "image_unavailable");
+    }
+    if outcomes.is_empty()
+        || outcomes
+            .iter()
+            .any(|(_, timestamp, outcome)| *outcome == 0 || *timestamp == 0)
+    {
+        return ("error", "not_started");
+    }
+    if frame_status != "ok" {
+        return ("error", "capture_stalled");
+    }
+    ("ok", "ok")
+}
+
 #[derive(Serialize, OaSchema, Deserialize, Clone)]
 pub struct HealthCheckResponse {
     pub status: String,
@@ -715,6 +751,9 @@ pub struct HealthCheckResponse {
     #[serde(default)]
     pub unhealthy_reasons: Vec<serde_json::Value>,
     pub last_frame_timestamp: Option<chrono::DateTime<Utc>>,
+    pub image_status: String,
+    pub image_reason: String,
+    pub latest_image_timestamp: Option<chrono::DateTime<Utc>>,
     pub last_audio_timestamp: Option<chrono::DateTime<Utc>>,
     pub frame_status: String,
     /// Why vision is in `frame_status`, as a stable machine-readable reason:
@@ -1063,6 +1102,9 @@ fn degraded_response() -> HealthCheckResponse {
             json!({"subsystem": "startup", "code": "health_snapshot_timeout", "severity": "warning", "detail": "health snapshot timed out", "remedy": "Retry the health request and inspect the engine log if it persists.", "since": null}),
         ],
         last_frame_timestamp: None,
+        image_status: "error".into(),
+        image_reason: "not_started".into(),
+        latest_image_timestamp: None,
         last_audio_timestamp: None,
         frame_status: "unknown".to_string(),
         vision_reason: "unknown".to_string(),
@@ -1574,6 +1616,27 @@ async fn health_check_inner(state: &Arc<AppState>) -> HealthCheckResponse {
         ocr_available,
     );
 
+    let image_outcomes = state
+        .vision_manager
+        .load()
+        .as_ref()
+        .as_ref()
+        .map(|manager| manager.image_capture_snapshots())
+        .unwrap_or_default();
+    let (image_status, image_reason) = classify_image_capture(
+        state.vision_disabled,
+        vision_capture_expected && !crate::sleep_monitor::screen_is_locked(),
+        state.vision_metrics.screenshot_capture_state(),
+        frame_status,
+        &image_outcomes,
+    );
+    let latest_image_timestamp = image_outcomes
+        .iter()
+        .map(|(_, ts, _)| *ts)
+        .filter(|ts| *ts > 0)
+        .max()
+        .and_then(|ts| Utc.timestamp_opt(ts as i64, 0).single());
+
     // Cross-check: if audio is enabled, uptime > 2 min, but zero chunks were ever
     // sent, the audio pipeline never started capturing (e.g. device retry loop).
     // The per-device timestamp fallback would mask this as "ok", so override here.
@@ -1945,6 +2008,9 @@ async fn health_check_inner(state: &Arc<AppState>) -> HealthCheckResponse {
         status: overall_status.to_string(),
         status_code,
         last_frame_timestamp: last_frame,
+        image_status: image_status.into(),
+        image_reason: image_reason.into(),
+        latest_image_timestamp,
         last_audio_timestamp: if last_audio_ts > 0 {
             Utc.timestamp_opt(last_audio_ts as i64, 0).single()
         } else if most_recent_audio_timestamp > 0 {
@@ -2095,6 +2161,16 @@ async fn health_check_inner(state: &Arc<AppState>) -> HealthCheckResponse {
         hostname: hostname::get().ok().and_then(|h| h.into_string().ok()),
         version: Some(env!("CARGO_PKG_VERSION").to_string()),
     };
+    if response.image_status == "error" {
+        response.status = "degraded".into();
+        response.status_code = 503;
+        response.message = "Screenshot images are unavailable; text or audio activity does not establish image capture.".into();
+        response.unhealthy_reasons.push(json!({
+            "subsystem": "image_capture", "code": response.image_reason,
+            "severity": "warning", "detail": "At least one active display has no successful image capture.",
+            "remedy": "Check capture exclusions and compositor support; do not disable privacy filters to hide this failure."
+        }));
+    }
     add_health_reasons(&mut response);
     response
 }
@@ -2456,6 +2532,50 @@ mod vision_stall_classification_tests {
 mod vision_reason_tests {
     use super::*;
     use screenpipe_screen::ScreenshotCaptureState as S;
+
+    #[test]
+    fn image_health_requires_pixels_on_every_active_display() {
+        assert_eq!(
+            classify_image_capture(false, true, S::Enabled, "ok", &[(1, 0, 2)]),
+            ("error", "image_unavailable")
+        );
+        assert_eq!(
+            classify_image_capture(false, true, S::Enabled, "ok", &[(1, 100, 1), (2, 0, 2)]),
+            ("error", "image_unavailable")
+        );
+        assert_eq!(
+            classify_image_capture(false, true, S::Enabled, "ok", &[(1, 100, 1), (2, 100, 1)]),
+            ("ok", "ok")
+        );
+        assert_eq!(
+            classify_image_capture(false, true, S::Enabled, "stale", &[(1, 100, 1)]),
+            ("error", "capture_stalled")
+        );
+        assert_eq!(
+            classify_image_capture(false, true, S::Enabled, "ok", &[]),
+            ("error", "not_started")
+        );
+    }
+
+    #[test]
+    fn intentionally_paused_images_are_not_failures() {
+        assert_eq!(
+            classify_image_capture(true, true, S::Enabled, "ok", &[]),
+            ("disabled", "disabled_by_setting")
+        );
+        assert_eq!(
+            classify_image_capture(false, false, S::Enabled, "ok", &[]),
+            ("idle", "no_displays_expected")
+        );
+        assert_eq!(
+            classify_image_capture(false, true, S::DisabledByConfig, "ok", &[]),
+            ("disabled", "screenshots_disabled_by_config")
+        );
+        assert_eq!(
+            classify_image_capture(false, true, S::DisabledByPowerProfile, "ok", &[]),
+            ("idle", "screenshots_disabled_by_power_profile")
+        );
+    }
 
     const GRANTED: bool = true;
     const DENIED: bool = false;
@@ -2823,6 +2943,9 @@ mod tests {
             unhealthy_reasons: vec![],
             status_code: 200,
             last_frame_timestamp: None,
+            image_status: "ok".into(),
+            image_reason: "ok".into(),
+            latest_image_timestamp: None,
             last_audio_timestamp: None,
             frame_status: "ok".to_string(),
             vision_reason: "ok".to_string(),

@@ -41,7 +41,7 @@ type StreamProps = HashMap<String, OwnedValue>;
 /// One scripted reply to `Start`: the streams and the restore token.
 struct StartScript {
     streams: Vec<(u32, StreamProps)>,
-    restore_token: &'static str,
+    restore_token: Option<&'static str>,
 }
 
 struct FakeScreenCast {
@@ -121,7 +121,8 @@ impl FakeScreenCast {
             .trim_start_matches(':')
             .replace('.', "_");
         let session = format!("{DESKTOP_PATH}/session/{sender}/{session_token}");
-        let results = HashMap::from([("session_handle".to_string(), owned(Value::from(session)))]);
+        let mut results =
+            HashMap::from([("session_handle".to_string(), owned(Value::from(session)))]);
         respond(connection, &request, results).await
     }
 
@@ -155,14 +156,13 @@ impl FakeScreenCast {
         #[zbus(connection)] connection: &zbus::Connection,
     ) -> zbus::fdo::Result<ObjectPath<'static>> {
         let script = self.start_scripts.lock().unwrap().remove(0);
-        let results = HashMap::from([
+        let mut results = HashMap::from([
             ("streams".to_string(), owned(Value::from(script.streams))),
-            (
-                "restore_token".to_string(),
-                owned(Value::from(script.restore_token)),
-            ),
             ("persist_mode".to_string(), owned(Value::from(2u32))),
         ]);
+        if let Some(token) = script.restore_token {
+            results.insert("restore_token".to_string(), owned(Value::from(token)));
+        }
         respond(connection, &request_path(&header, &options), results).await
     }
 
@@ -270,14 +270,22 @@ fn portal_session_persists_forgets_and_presents_the_restore_token() {
     let start_scripts = Arc::new(Mutex::new(vec![
         StartScript {
             streams: vec![workspace_stream()],
-            restore_token: "tok-workspace",
+            restore_token: Some("tok-workspace"),
         },
         StartScript {
             streams: vec![
                 output_stream(201, 1920, "DP-2"),
                 output_stream(202, 0, "DP-1"),
             ],
-            restore_token: "tok-screens",
+            restore_token: Some("tok-screens"),
+        },
+        StartScript {
+            streams: vec![output_stream(301, 0, "DP-1")],
+            restore_token: None,
+        },
+        StartScript {
+            streams: vec![output_stream(401, 0, "DP-1")],
+            restore_token: None,
         },
     ]));
     let _portal = zbus::blocking::connection::Builder::address(bus.address.as_str())
@@ -323,6 +331,15 @@ fn portal_session_persists_forgets_and_presents_the_restore_token() {
             // Next boot: the token saved on disk is presented to the portal.
             SelectCall {
                 restore_token: Some("tok-seeded".into()),
+                persist_mode: Some(PersistMode::ExplicitlyRevoked as u32),
+            },
+            SelectCall {
+                restore_token: Some("tok-screens".into()),
+                persist_mode: Some(PersistMode::ExplicitlyRevoked as u32),
+            },
+            // No replacement from the previous Start: fresh consent, no replay.
+            SelectCall {
+                restore_token: None,
                 persist_mode: Some(PersistMode::ExplicitlyRevoked as u32),
             },
         ]
@@ -390,5 +407,11 @@ fn child_drives_portal_sessions() {
             Some("tok-screens")
         );
         assert_eq!(store.load().as_deref(), Some("tok-screens"));
+        for _ in 0..2 {
+            let error = drive(&shared).await.unwrap_err();
+            assert!(format!("{error:#}").contains("failed to open portal PipeWire remote"));
+            assert_eq!(shared.current_restore_token(), None);
+            assert_eq!(store.load(), None);
+        }
     });
 }

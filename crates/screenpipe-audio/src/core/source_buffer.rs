@@ -38,6 +38,15 @@ use super::device_detection::InputDeviceKind;
 /// (the 30 s segment just has fewer real samples, which Whisper handles fine via VAD).
 const MAX_SILENCE_INSERT_MS: f64 = 500.0;
 
+/// Most the buffer may run *ahead* of the clock in its own books — 500 ms.
+///
+/// Hosts hand over audio in bursts (PipeWire/PulseAudio, and CPAL's own
+/// Bluetooth batching), which legitimately delivers more audio than time has
+/// passed. That credit must be remembered, or ordinary jitter gets charged as
+/// packet loss — but it must not accumulate without limit, or a single startup
+/// burst would suppress gap-filling for the rest of the session.
+const MAX_CREDIT_MS: f64 = 500.0;
+
 /// Bluetooth / unknown: tight threshold — packet drops show up as large gaps vs chunk cadence.
 const GAP_THRESHOLD_MULTIPLIER_BLUETOOTH: f64 = 1.5;
 
@@ -63,6 +72,14 @@ pub struct SourceBuffer {
 
     /// Timestamp of the last chunk push — used to detect inter-chunk gaps.
     last_chunk_time: Option<Instant>,
+
+    /// How far behind the wall clock this buffer has fallen, in ms.
+    ///
+    /// Grows when real time passes without audio arriving, shrinks when audio
+    /// arrives faster than real time (a burst) and when silence is inserted.
+    /// Silence may only be inserted against a positive balance, which is what
+    /// stops delivery jitter from being charged as packet loss.
+    drift_ms: f64,
 
     /// Expected duration of a single chunk, derived from the first chunk we see.
     /// Updated as chunk sizes change.
@@ -90,6 +107,7 @@ impl SourceBuffer {
             sample_rate,
             pending: VecDeque::new(),
             last_chunk_time: None,
+            drift_ms: 0.0,
             expected_chunk_duration_ms: None,
             last_wired_gap_warn: None,
             gaps_detected: 0,
@@ -123,6 +141,14 @@ impl SourceBuffer {
             (self.last_chunk_time, self.expected_chunk_duration_ms)
         {
             let elapsed_ms = last_time.elapsed().as_secs_f64() * 1000.0;
+
+            // Book-keeping first: real time that passed, minus audio actually
+            // handed over. Real-time delivery nets to ~0; a burst goes negative
+            // (this chunk covers time already accounted for); a true dropout
+            // goes positive. Credit is capped so one startup burst cannot
+            // silence gap-filling for the rest of the session.
+            self.drift_ms = (self.drift_ms + elapsed_ms - chunk_duration_ms).max(-MAX_CREDIT_MS);
+
             let mult = if self.device_kind.is_bluetooth() {
                 GAP_THRESHOLD_MULTIPLIER_BLUETOOTH
             } else {
@@ -130,11 +156,29 @@ impl SourceBuffer {
             };
             let threshold_ms = expected_ms * mult;
 
-            if elapsed_ms > threshold_ms {
-                // How many ms of audio are genuinely missing?
-                let gap_ms = (elapsed_ms - expected_ms).min(MAX_SILENCE_INSERT_MS);
+            // Decide on the accumulated deficit, not on this one arrival.
+            //
+            // At the instant a chunk is late, "late" and "lost" are
+            // indistinguishable — the next burst may hand over the very audio
+            // that appears to be missing. Hosts that batch (PipeWire/PulseAudio,
+            // and CPAL's own Bluetooth batching) do exactly that, so judging by
+            // inter-arrival delay invents holes: jitter of ±one chunk nets to
+            // zero across two pushes, while a genuine dropout leaves a deficit
+            // that persists. `drift_ms` is that deficit, and it is the only
+            // honest measure of missing audio available here.
+            if self.drift_ms > threshold_ms {
+                let gap_ms = self.drift_ms.min(MAX_SILENCE_INSERT_MS);
                 let silence_samples =
                     ((gap_ms * self.sample_rate as f64) / 1000.0).round() as usize;
+
+                // Zero means delivery was late but the audio is all here — a
+                // burst, not a dropout. Buffer the chunk untouched.
+                if silence_samples == 0 {
+                    self.pending.extend(samples);
+                    self.last_chunk_time = Some(now);
+                    self.chunks_received += 1;
+                    return;
+                }
 
                 if self.device_kind.is_bluetooth() {
                     debug!(
@@ -163,6 +207,8 @@ impl SourceBuffer {
                 for _ in 0..silence_samples {
                     self.pending.push_back(0.0);
                 }
+                // The inserted silence repays that much of the deficit.
+                self.drift_ms -= gap_ms;
                 self.gaps_detected += 1;
                 self.silence_inserted_samples += silence_samples as u64;
             }
@@ -228,6 +274,103 @@ mod tests {
         assert_eq!(out.len(), 320);
         assert_eq!(buf.gaps_detected, 0);
         assert_eq!(buf.silence_inserted_samples, 0);
+    }
+
+    /// Total audio out must never exceed the wall clock.
+    ///
+    /// This is the invariant screenpipe 0.4.29/0.4.30 violated on a
+    /// PipeWire host: bursty delivery read as packet loss, ~40% of every
+    /// recording replaced by inserted zeros, and 30 s files filling in 17.6 s.
+    #[test]
+    fn burst_delivery_does_not_manufacture_silence() {
+        let mut buf = SourceBuffer::new("bluez_output.88_C9_E8_54_4C_4B.1", 16000);
+
+        // A burst: ten 20 ms chunks handed over back-to-back, as a
+        // PipeWire/PulseAudio client sees them. Real elapsed time is ~0.
+        for _ in 0..10 {
+            buf.push(make_chunk(320));
+            buf.drain_all();
+        }
+
+        // Each arrival after the first looks like a "gap" to the inter-arrival
+        // heuristic, but no audio is missing — the burst already delivered it.
+        assert_eq!(
+            buf.silence_inserted_samples, 0,
+            "burst delivery must not be charged as packet loss"
+        );
+    }
+
+    /// The regression that mattered: a stream that keeps up overall must not
+    /// accumulate inserted silence, even when individual arrivals are late.
+    ///
+    /// Measured on a KDE/PipeWire host, screenpipe 0.4.29 and 0.4.30 emitted
+    /// 30 s of audio every 17.6 s — ~40% of every recording was inserted zeros,
+    /// in 90–250 ms runs landing inside word boundaries. Nothing logged it:
+    /// Bluetooth gaps log at `debug`, wired warnings are rate-limited to one
+    /// per 30 s.
+    #[test]
+    fn jittery_but_complete_delivery_inserts_almost_nothing() {
+        let mut buf = SourceBuffer::new("bluez_output.88_C9_E8_54_4C_4B.1", 16000);
+
+        // 100 chunks of 20 ms delivered in pairs: 40 ms of wall clock passes,
+        // then two chunks arrive back-to-back covering exactly those 40 ms.
+        // Nothing is missing — the audio simply arrives in bursts, which is how
+        // PipeWire/PulseAudio and CPAL's Bluetooth batching actually behave.
+        for i in 0..100 {
+            buf.push(make_chunk(320));
+            buf.drain_all();
+            let pretend_elapsed = if i % 2 == 0 { 40 } else { 0 };
+            buf.last_chunk_time = Some(Instant::now() - Duration::from_millis(pretend_elapsed));
+        }
+
+        let inserted_ms = (buf.silence_inserted_samples as f64 / 16000.0) * 1000.0;
+        let real_audio_ms = 100.0 * 20.0;
+        assert!(
+            inserted_ms < real_audio_ms * 0.05,
+            "inserted {inserted_ms:.0}ms of silence into {real_audio_ms:.0}ms of \
+             complete audio ({:.0}% of the recording)",
+            100.0 * inserted_ms / (inserted_ms + real_audio_ms)
+        );
+    }
+
+    #[test]
+    fn credit_from_a_burst_is_capped() {
+        let mut buf = SourceBuffer::new("AirPods Pro", 16000);
+
+        // A big startup burst banks credit...
+        for _ in 0..200 {
+            buf.push(make_chunk(320)); // 200 * 20ms = 4s delivered instantly
+            buf.drain_all();
+        }
+        assert!(
+            buf.drift_ms >= -MAX_CREDIT_MS - 1.0,
+            "credit must be clamped"
+        );
+
+        // ...and a genuine dropout after it must still be filled.
+        buf.last_chunk_time = Some(Instant::now() - Duration::from_millis(1500));
+        buf.push(make_chunk(320));
+        assert!(
+            buf.silence_inserted_samples > 0,
+            "a real dropout after a burst must still be filled"
+        );
+    }
+
+    #[test]
+    fn genuine_gap_still_inserts_silence_when_behind() {
+        let mut buf = SourceBuffer::new("Built-in Microphone", 16000);
+        buf.push(make_chunk(320)); // 20ms, establishes cadence
+        buf.drain_all();
+
+        // Real time passes with no audio delivered at all: the buffer falls
+        // behind the clock, so silence here is correct and must still happen.
+        buf.last_chunk_time = Some(Instant::now() - Duration::from_millis(300));
+        buf.push(make_chunk(320));
+
+        assert!(
+            buf.silence_inserted_samples > 0,
+            "a real dropout must still be filled"
+        );
     }
 
     #[test]

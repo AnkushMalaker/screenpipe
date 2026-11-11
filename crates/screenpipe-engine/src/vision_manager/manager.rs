@@ -923,6 +923,17 @@ impl VisionManager {
             .unwrap_or(false)
     }
 
+    /// Pixel outcomes remain per display: metadata on one cannot hide image failure on another.
+    pub(crate) fn image_capture_snapshots(&self) -> Vec<(u32, u64, u8)> {
+        self.monitor_liveness
+            .iter()
+            .map(|entry| {
+                let (timestamp, outcome) = entry.value().image_capture_snapshot();
+                (*entry.key(), timestamp, outcome)
+            })
+            .collect()
+    }
+
     /// Independent liveness for each active capture loop. Never derive this
     /// from aggregate `vision_metrics`: on a multi-monitor system a healthy
     /// loop continually refreshes those global timestamps and can otherwise
