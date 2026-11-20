@@ -271,3 +271,175 @@ mod tests {
         assert!(WATCHER_JS.contains("onActivated(workspace.activeWindow)"));
     }
 }
+
+// Focus admission cannot use the asynchronous metadata cache: a delayed push
+// could attribute a different monitor's AX/OCR to this frame. Ask KWin for an
+// atomic snapshot, using compositor coordinates throughout (including scaling).
+#[derive(serde::Deserialize)]
+struct FocusRect {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+}
+#[derive(serde::Deserialize)]
+struct FocusOutput {
+    name: String,
+    rect: FocusRect,
+}
+#[derive(serde::Deserialize)]
+struct FocusSnapshot {
+    window: Option<FocusRect>,
+    outputs: Vec<FocusOutput>,
+}
+fn focus_output(snapshot: FocusSnapshot) -> Option<String> {
+    fn valid(rect: &FocusRect) -> bool {
+        [rect.x, rect.y, rect.width, rect.height]
+            .iter()
+            .all(|v| v.is_finite())
+            && rect.width > 0.0
+            && rect.height > 0.0
+    }
+    let window = snapshot.window?;
+    if !valid(&window) || snapshot.outputs.len() > 64 {
+        return None;
+    }
+    let x = window.x + window.width / 2.0;
+    let y = window.y + window.height / 2.0;
+    let mut owners = snapshot.outputs.iter().filter(|output| {
+        valid(&output.rect)
+            && x >= output.rect.x
+            && y >= output.rect.y
+            && x < output.rect.x + output.rect.width
+            && y < output.rect.y + output.rect.height
+    });
+    let owner = owners.next()?;
+    if owner.name.is_empty() || owners.next().is_some() {
+        return None;
+    }
+    Some(owner.name.clone())
+}
+struct FocusReply(std::sync::mpsc::Sender<String>);
+#[zbus::interface(name = "com.screenpipe.FocusSnapshot")]
+impl FocusReply {
+    fn snapshot(&self, json: String) {
+        if json.len() <= 64 * 1024 {
+            let _ = self.0.send(json);
+        }
+    }
+}
+
+/// Fresh KDE output connector hosting the focused window, or no admission when
+/// the compositor cannot establish a unique owner. Does not use cursor position
+/// or the asynchronous focused-window metadata cache. Other Linux compositors
+/// remain unsupported and return None. Call on a blocking worker.
+pub fn get_focused_output_fresh() -> Option<String> {
+    if !is_kde_session() {
+        return None;
+    }
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let query = || -> anyhow::Result<Option<String>> {
+        let (send, recv) = std::sync::mpsc::channel();
+        let conn = zbus::blocking::connection::Builder::session()?
+            .method_timeout(Duration::from_millis(250))
+            .serve_at("/com/screenpipe/FocusSnapshot", FocusReply(send))?
+            .build()?;
+        let destination = serde_json::to_string(
+            conn.unique_name()
+                .ok_or_else(|| anyhow::anyhow!("missing bus identity"))?
+                .as_str(),
+        )?;
+        let mut file = tempfile::NamedTempFile::new()?;
+        write!(
+            file,
+            "var destination = {destination};\n{}",
+            include_str!("linux_kwin_focus.js")
+        )?;
+        file.flush()?;
+        let name = format!(
+            "screenpipe-focus-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let result = (|| {
+            let reply = conn.call_method(
+                Some("org.kde.KWin"),
+                "/Scripting",
+                Some("org.kde.kwin.Scripting"),
+                "loadScript",
+                &(file.path().to_string_lossy().as_ref(), &name),
+            )?;
+            let id: i32 = reply.body().deserialize()?;
+            anyhow::ensure!(id >= 0, "KWin rejected focus query");
+            conn.call_method(
+                Some("org.kde.KWin"),
+                format!("/Scripting/Script{id}"),
+                Some("org.kde.kwin.Script"),
+                "run",
+                &(),
+            )?;
+            let json = recv.recv_timeout(Duration::from_millis(500))?;
+            Ok(focus_output(serde_json::from_str(&json)?))
+        })();
+        let _ = conn.call_method(
+            Some("org.kde.KWin"),
+            "/Scripting",
+            Some("org.kde.kwin.Scripting"),
+            "unloadScript",
+            &name,
+        );
+        result
+    };
+    query().unwrap_or_else(|error| {
+        debug!(%error, "KWin focused-output admission unavailable");
+        None
+    })
+}
+
+#[cfg(test)]
+mod focus_tests {
+    use super::*;
+    fn snapshot(window: &str, outputs: &str) -> FocusSnapshot {
+        serde_json::from_str(&format!(r#"{{"window":{window},"outputs":{outputs}}}"#)).unwrap()
+    }
+    #[test]
+    #[ignore = "requires an active KDE desktop with a focused window"]
+    fn live_fresh_focus_query_latency() {
+        let mut timings = Vec::new();
+        for _ in 0..20 {
+            let start = Instant::now();
+            assert!(
+                get_focused_output_fresh().is_some(),
+                "no fresh focused output"
+            );
+            timings.push(start.elapsed().as_micros());
+        }
+        eprintln!(
+            "fresh_focus_queries=20 mean_us={} max_us={}",
+            timings.iter().sum::<u128>() / 20,
+            timings.iter().max().unwrap()
+        );
+    }
+    const OUTPUTS: &str = r#"[{"name":"DP-1","rect":{"x":-1280,"y":0,"width":1280,"height":720}},{"name":"DP-2","rect":{"x":0,"y":0,"width":1707,"height":960}}]"#;
+    #[test]
+    fn logical_coordinates_assign_spanning_focus_once_at_half_open_edge() {
+        // Different physical scales do not enter compositor-coordinate ownership.
+        let s = snapshot(r#"{"x":-100,"y":0,"width":200,"height":100}"#, OUTPUTS);
+        assert_eq!(focus_output(s).as_deref(), Some("DP-2"));
+        let s = snapshot(r#"{"x":-300,"y":0,"width":200,"height":100}"#, OUTPUTS);
+        assert_eq!(focus_output(s).as_deref(), Some("DP-1"));
+    }
+    #[test]
+    fn missing_invalid_offscreen_and_ambiguous_focus_deny_admission() {
+        for window in [
+            "null",
+            r#"{"x":0,"y":0,"width":0,"height":100}"#,
+            r#"{"x":5000,"y":0,"width":100,"height":100}"#,
+        ] {
+            assert!(focus_output(snapshot(window, OUTPUTS)).is_none());
+        }
+        let window = r#"{"x":0,"y":0,"width":100,"height":100}"#;
+        let outputs = r#"[{"name":"A","rect":{"x":0,"y":0,"width":200,"height":200}},{"name":"B","rect":{"x":0,"y":0,"width":200,"height":200}}]"#;
+        assert!(focus_output(snapshot(window, outputs)).is_none());
+    }
+}

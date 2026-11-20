@@ -3242,7 +3242,19 @@ async fn monitor_hosts_focused_window(params: &CaptureParams<'_>) -> bool {
         .flatten()
             == Some(params.monitor_id)
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "linux")]
+    {
+        let output_name = params.monitor.name();
+        if output_name.is_empty() {
+            return false;
+        }
+        tokio::task::spawn_blocking(screenpipe_a11y::platform::linux_kwin::get_focused_output_fresh)
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|owner| owner == output_name)
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     {
         let bounds = tokio::task::spawn_blocking(|| {
             #[cfg(target_os = "macos")]
