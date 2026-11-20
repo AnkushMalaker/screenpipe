@@ -10,11 +10,28 @@
 // build.rs for local Windows devs).
 
 fn main() {
-    #[cfg(target_os = "macos")]
-    {
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
         // Swift runtime rpath — Swift dylibs (libswift_Concurrency etc.) used by
         // the vision/capture Swift bridges live in this directory.
         println!("cargo:rustc-link-arg=-Wl,-rpath,/usr/lib/swift");
+
+        // A standalone tool needs its own identity and TCC purpose strings;
+        // it cannot inherit the desktop app's Info.plist under launchd.
+        println!("cargo:rerun-if-changed=cli-Info.plist");
+        let plist = std::path::PathBuf::from(
+            std::env::var_os("CARGO_MANIFEST_DIR").expect("Cargo sets CARGO_MANIFEST_DIR"),
+        )
+        .join("cli-Info.plist");
+        // Separate linker arguments preserve paths containing spaces or commas.
+        for argument in [
+            "-sectcreate",
+            "__TEXT",
+            "__info_plist",
+            plist.to_str().expect("UTF-8 manifest path"),
+        ] {
+            println!("cargo:rustc-link-arg-bin=screenpipe=-Xlinker");
+            println!("cargo:rustc-link-arg-bin=screenpipe={argument}");
+        }
     }
 
     // Windows: raise the main-thread stack reserve from the 1 MiB PE default to

@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- screenpipe — AI that knows everything you've seen, said, or heard -->
+<!-- https://screenpipe.com -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>com.screenpipe.cli</string>
+    <key>CFBundleName</key>
+    <string>Screenpipe Recorder</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Screenpipe records microphone audio to your local capture history when audio recording is enabled.</string>
+    <key>NSAudioCaptureUsageDescription</key>
+    <string>Screenpipe records system audio to your local capture history when audio recording is enabled.</string>
+    <key>NSScreenCaptureUsageDescription</key>
+    <string>Screenpipe records your screen to your local capture history according to your recording settings.</string>
+</dict>
+</plist>
